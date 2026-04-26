@@ -600,10 +600,6 @@ void gpt3_5::process(std::string message, const msg_meta &conf)
         }
     }
 
-    // Auto-archive check
-    perform_archive(id, conf, true);
-
-
     const std::vector<cmd_exact_rule> exact_rules = {
         {".test",
          [&]() {
@@ -1083,7 +1079,7 @@ void gpt3_5::perform_archive(int64_t id, const msg_meta &conf, bool is_auto,
     tm tm_res = *std::gmtime(&now);
     char time_buf[64];
     if (is_auto) {
-        std::strftime(time_buf, sizeof(time_buf), "%Y-%m-%d_auto", &tm_res);
+        std::strftime(time_buf, sizeof(time_buf), "%Y-%m-%d_%H-%M-%S_beforeCompress", &tm_res);
     } else {
         std::strftime(time_buf, sizeof(time_buf), "%Y-%m-%d_%H-%M-%S", &tm_res);
     }
@@ -1091,7 +1087,14 @@ void gpt3_5::perform_archive(int64_t id, const msg_meta &conf, bool is_auto,
     std::string filename = std::string(time_buf) + ".json";
     std::string full_path = backup_dir + "/" + filename;
 
-    if (is_auto && fs::exists(full_path)) return;
+    if (is_auto && fs::exists(full_path)) {
+        int suffix = 1;
+        do {
+            filename = std::string(time_buf) + "_" + std::to_string(suffix) + ".json";
+            full_path = backup_dir + "/" + filename;
+            ++suffix;
+        } while (fs::exists(full_path));
+    }
 
     Json::Value J;
     {
