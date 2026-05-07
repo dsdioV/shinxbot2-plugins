@@ -558,6 +558,81 @@ bool gpt3_5::message_has_wake_keyword(const std::string &message)
     return false;
 }
 
+static bool extract_leading_reply_id(const std::string &message,
+                                     int64_t &reply_id)
+{
+    if (!starts_with(message, "[CQ:reply,id=")) return false;
+
+    size_t id_start = 13;
+    size_t id_end = message.find_first_of(",]", id_start);
+    if (id_end == std::string::npos || id_end <= id_start) return false;
+
+    try {
+        reply_id = std::stoll(message.substr(id_start, id_end - id_start));
+        return true;
+    }
+    catch (...) {
+        reply_id = -1;
+        return false;
+    }
+}
+
+static void strip_leading_reply_segment(std::string &message, int64_t &reply_id)
+{
+    if (!extract_leading_reply_id(message, reply_id)) return;
+
+    size_t pos = message.find(']');
+    if (pos != std::string::npos) {
+        message = trim(message.substr(pos + 1));
+    }
+}
+
+static bool message_replies_to_bot(const msg_meta &conf, int64_t reply_id)
+{
+    if (reply_id == -1 || conf.p == nullptr) return false;
+
+    try {
+        Json::Value get_msg_param;
+        get_msg_param["message_id"] = reply_id;
+        Json::Value msg_info =
+            string_to_json(conf.p->cq_send("get_msg", get_msg_param));
+        if (msg_info["retcode"].asInt() != 0 ||
+            !msg_info.isMember("data") ||
+            !msg_info["data"].isMember("sender") ||
+            !msg_info["data"]["sender"].isMember("user_id")) {
+            return false;
+        }
+        return msg_info["data"]["sender"]["user_id"].asUInt64() ==
+               conf.p->get_botqq();
+    }
+    catch (...) {
+        return false;
+    }
+}
+
+static void send_forward_text(const std::string &content, const msg_meta &conf,
+                              const std::string &node_name)
+{
+    if (conf.p == nullptr) return;
+
+    Json::Value J;
+    Json::Value node;
+    node["type"] = "node";
+    node["data"]["name"] = node_name;
+    node["data"]["uin"] = std::to_string(conf.p->get_botqq());
+    node["data"]["content"] = string_to_messageArr(content);
+    J["messages"].append(node);
+
+    if (conf.message_type == "group") {
+        J["group_id"] = conf.group_id;
+        conf.p->cq_send("send_group_forward_msg", J);
+    }
+    else {
+        J["user_id"] = conf.user_id;
+        conf.p->cq_send("send_private_forward_msg", J);
+    }
+}
+
 std::string gpt3_5::get_quoted_content(const bot *p, int64_t reply_id, int depth)
 {
     if (depth > 5) return "...(too deep)";
@@ -740,17 +815,7 @@ void gpt3_5::process(std::string message, const msg_meta &conf)
     if (conf.user_id == conf.p->get_botqq()) return;
 
     int64_t reply_id = -1;
-    if (starts_with(message, "[CQ:reply,id=")) {
-        size_t id_start = 13;
-        size_t id_end = message.find_first_of(",]", id_start);
-        if (id_end != std::string::npos) {
-            reply_id = std::stoll(message.substr(id_start, id_end - id_start));
-        }
-        size_t pos = message.find(']');
-        if (pos != std::string::npos) {
-            message = trim(message.substr(pos + 1));
-        }
-    }
+    strip_leading_reply_segment(message, reply_id);
 
     if (cmd_match_exact(message, {"你说的话我不喜欢"}) && reply_id != -1) {
         Json::Value get_msg_param;
@@ -777,6 +842,7 @@ void gpt3_5::process(std::string message, const msg_meta &conf)
 
     std::string nickname = get_cached_nickname(conf);
     bool is_group = conf.message_type == "group";
+    bool reply_to_bot = is_group && message_replies_to_bot(conf, reply_id);
     bool at_mentioned = is_group && message_mentions_bot(message, conf);
     bool keyword_mentioned = is_group && message_has_wake_keyword(message);
 
@@ -787,7 +853,8 @@ void gpt3_5::process(std::string message, const msg_meta &conf)
 
     bool explicit_ai = starts_with(working_message, ".ai");
     bool should_reply = explicit_ai || (reply_on_at && at_mentioned) ||
-                        (reply_on_keyword && keyword_mentioned) || !is_group;
+                        reply_to_bot || (reply_on_keyword && keyword_mentioned) ||
+                        !is_group;
 
     if (!should_reply) {
         return;
@@ -802,6 +869,9 @@ void gpt3_5::process(std::string message, const msg_meta &conf)
     message = do_black(message);
     if (!explicit_ai && at_mentioned && trim(message).empty()) {
         message = "（对方只 @ 了你，没有输入文字。请根据当前对话简短回应。）";
+    }
+    else if (!explicit_ai && reply_to_bot && trim(message).empty()) {
+        message = "（对方回复了你的消息，但没有输入文字。请根据被回复内容简短回应。）";
     }
 
     std::istringstream iss(message);
@@ -1069,7 +1139,7 @@ void gpt3_5::process(std::string message, const msg_meta &conf)
                          std::to_string(reply_on_keyword) + "\n";
                 reply += "note: request order is prompt -> active history -> current user";
             }
-            conf.p->cq_send(reply, conf);
+            send_forward_text(reply, conf, "AI Status");
             return true;
         }},
     };
@@ -1225,7 +1295,7 @@ void gpt3_5::process(std::string message, const msg_meta &conf)
         }
 
         std::string reply_msg = "[CQ:reply,id=" + std::to_string(conf.message_id) +
-                                "] " + aimsg;
+                                "]" + aimsg;
     {
         std::unique_lock<std::recursive_mutex> lock_data(data_lock);
             last_prompt_tokens[id] = prompt_tokens;
@@ -1267,17 +1337,16 @@ void gpt3_5::process(std::string message, const msg_meta &conf)
 bool gpt3_5::check(std::string message, const msg_meta &conf)
 {
     if (conf.user_id == conf.p->get_botqq()) return false;
-    if (starts_with(message, "[CQ:reply,id=")) {
-        size_t pos = message.find(']');
-        if (pos != std::string::npos) {
-            message = trim(message.substr(pos + 1));
-        }
-    }
+
+    int64_t reply_id = -1;
+    strip_leading_reply_segment(message, reply_id);
+
     if (cmd_match_exact(message, {"你说的话我不喜欢"})) {
         return true;
     }
     if (conf.message_type == "group" &&
-        ((reply_on_at && message_mentions_bot(message, conf)) ||
+        ((reply_id != -1 && message_replies_to_bot(conf, reply_id)) ||
+         (reply_on_at && message_mentions_bot(message, conf)) ||
          (reply_on_keyword && message_has_wake_keyword(message)))) {
         return true;
     }
@@ -1286,10 +1355,10 @@ bool gpt3_5::check(std::string message, const msg_meta &conf)
 
 std::string gpt3_5::help()
 {
-    return "OpenAI GPT-3.5：使用 .ai [内容] 开始对话\n"
+    return "OpenAI GPT-3.5：使用 .ai [内容]、@bot 或回复 bot 消息开始对话\n"
            "指令列表：\n"
            ".ai.reset - 重置当前对话上下文\n"
-           ".ai.status - 查看当前实际生效的模型/阈值/历史长度估算\n"
+           ".ai.status - 以合并转发查看当前实际生效的模型/阈值/历史长度估算\n"
            ".ai.compress - 压缩旧上下文并保留最近对话\n"
            ".ai.change [模式] - 切换提示词模式\n"
            ".ai.arc - 手动归档当前上下文\n"
