@@ -17,6 +17,9 @@ private:
     std::map<int64_t, std::string> pre_default;
     std::map<int64_t, Json::Value> pre_prompt;
     std::map<int64_t, Json::Value> history;
+    std::map<int64_t, Json::Value> group_recent;
+    std::map<int64_t, std::string> group_summary;
+    std::map<userid_t, std::string> nickname_cache;
     std::map<int64_t, int64_t> last_prompt_tokens;
     std::map<int64_t, int64_t> last_completion_tokens;
     std::map<int64_t, int64_t> last_total_tokens;
@@ -25,12 +28,46 @@ private:
     std::set<int64_t> active_ids;
     std::map<std::string, Json::Value> mode_prompt;
     std::vector<std::string> key;
+    std::vector<std::string> wake_keywords;
     size_t key_cycle;
     std::string base_url;
     std::string model_name;
+    std::string group_compress_model;
+    std::string group_context_summary_prompt;
     int compress_recent_rounds = 10;
+    bool record_group_messages = true;
+    bool reply_on_at = true;
+    bool reply_on_keyword = false;
+    bool group_context_show_time = true;
+    bool group_context_show_user_id = false;
+    bool active_context_show_time = true;
+    bool active_context_show_user_id = true;
+    int group_context_keep_lines = 10;
+    int group_context_include_lines = 10;
     std::string get_quoted_content(const bot *p, int64_t reply_id, int depth = 0);
     std::string expand_forward_content(const bot *p, const std::string &forward_id, int depth);
+    std::string get_cached_nickname(const msg_meta &conf);
+    std::string get_short_time();
+    std::string simplify_cq_codes(const std::string &message, userid_t botqq = 0);
+    std::string strip_bot_at(const std::string &message, const msg_meta &conf);
+    std::string format_context_message(const std::string &message,
+                                       const msg_meta &conf,
+                                       const std::string &nickname,
+                                       bool active,
+                                       int64_t reply_id = -1,
+                                       bool include_quote = false);
+    bool message_mentions_bot(const std::string &message, const msg_meta &conf);
+    bool message_has_wake_keyword(const std::string &message);
+    int64_t estimate_text_tokens(const std::string &text);
+    int64_t estimate_group_context_tokens(int64_t id);
+    void append_group_context(int64_t id, Json::Value &messages);
+    void record_group_context(int64_t id, const std::string &compact_message);
+    bool compress_group_context_with_key(int64_t id, size_t keyid,
+                                         const msg_meta &conf,
+                                         std::string *error_message = nullptr);
+    bool maybe_compress_group_context(int64_t id, const msg_meta &conf,
+                                      bool force = false,
+                                      std::string *error_message = nullptr);
     bool try_acquire_session(int64_t id, size_t keyid, const msg_meta &conf,
                              bool ensure_default_prompt = true);
     void release_session(int64_t id, size_t keyid);

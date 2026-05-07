@@ -10,6 +10,8 @@
 #include <ctime>
 #include <cstring>
 #include <chrono>
+#include <algorithm>
+#include <cctype>
 
 /**
  * Overall API intro: https://platform.openai.com/docs/api-reference/chat/create
@@ -49,13 +51,27 @@ gpt3_5::gpt3_5()
                   << std::endl;
         std::ofstream of(openai_conf_path, std::ios::out);
         of << "{"
+              "\"base_url\": \"https://api.openai.com\","
               "\"keys\": [\"\"],"
+              "\"model\": \"gpt-3.5-turbo-1106\","
               "\"mode\": [\"default\"],"
               "\"default\": [{\"role\": \"system\", \"content\": \"You are a "
               "helpful assistant.\"}],"
               "\"black_list\": [\"股票\"],"
               "\"compress_summary_prompt\": \"\","
               "\"compress_recent_rounds\": 10,"
+              "\"record_group_messages\": true,"
+              "\"reply_on_at\": true,"
+              "\"reply_on_keyword\": false,"
+              "\"wake_keywords\": [\"bot\", \"猫猫\"],"
+              "\"group_compress_model\": \"deepseek-v4-flash\","
+              "\"group_context_keep_lines\": 10,"
+              "\"group_context_include_lines\": 10,"
+              "\"group_context_show_time\": true,"
+              "\"group_context_show_user_id\": false,"
+              "\"active_context_show_time\": true,"
+              "\"active_context_show_user_id\": true,"
+              "\"group_context_summary_prompt\": \"Summarize the recent group conversation in the original conversation language, so the assistant can keep enough context for later replies. Preserve topic flow, participants, unresolved questions, tone, and references likely to matter next. Output concise summary only.\","
               "\"MAX_TOKEN\": 4000,"
               "\"MAX_REPLY\": 700,"
               "\"RED_LINE\": 1000"
@@ -91,9 +107,34 @@ gpt3_5::gpt3_5()
     RED_LINE = res["RED_LINE"].asInt();
     base_url = res.get("base_url", "https://api.openai.com").asString();
     model_name = res.get("model", "gpt-3.5-turbo").asString();
+    group_compress_model = res.get("group_compress_model", "deepseek-v4-flash").asString();
     compress_summary_prompt = res["compress_summary_prompt"].asString();
+    group_context_summary_prompt = res.get(
+        "group_context_summary_prompt",
+        "Summarize the recent group conversation in the original conversation language, so the assistant can keep enough context for later replies. Preserve topic flow, participants, unresolved questions, tone, and references likely to matter next. Output concise summary only.").asString();
     compress_recent_rounds = res.get("compress_recent_rounds", 10).asInt();
     if (compress_recent_rounds < 1) compress_recent_rounds = 1;
+    record_group_messages = res.get("record_group_messages", true).asBool();
+    reply_on_at = res.get("reply_on_at", true).asBool();
+    reply_on_keyword = res.get("reply_on_keyword", false).asBool();
+    group_context_keep_lines = res.get("group_context_keep_lines", 10).asInt();
+    group_context_include_lines = res.get("group_context_include_lines", 10).asInt();
+    group_context_show_time = res.get("group_context_show_time", true).asBool();
+    group_context_show_user_id = res.get("group_context_show_user_id", false).asBool();
+    active_context_show_time = res.get("active_context_show_time", true).asBool();
+    active_context_show_user_id = res.get("active_context_show_user_id", true).asBool();
+    if (group_context_keep_lines < 1) group_context_keep_lines = 1;
+    if (group_context_include_lines < 1) group_context_include_lines = 1;
+    if (res.isMember("wake_keywords") && res["wake_keywords"].isArray()) {
+        for (Json::ArrayIndex i = 0; i < res["wake_keywords"].size(); ++i) {
+            std::string keyword = trim(res["wake_keywords"][i].asString());
+            if (!keyword.empty()) wake_keywords.push_back(keyword);
+        }
+    }
+    if (wake_keywords.empty()) {
+        wake_keywords.push_back("vvbot");
+        wake_keywords.push_back("vvm");
+    }
 
     is_open = true;
     is_debug = false;
@@ -116,6 +157,13 @@ gpt3_5::gpt3_5()
             Json::Value J = string_to_json(readfile(entry.path()));
             history[id] = J["history"];
             pre_default[id] = J["pre_prompt"].asString();
+            if (pre_default[id].empty()) pre_default[id] = default_prompt;
+            if (J.isMember("group_recent") && J["group_recent"].isArray()) {
+                group_recent[id] = J["group_recent"];
+            }
+            if (J.isMember("group_summary")) {
+                group_summary[id] = J["group_summary"].asString();
+            }
         }
     }
 }
@@ -126,13 +174,26 @@ void gpt3_5::save_file()
     Json::Value J;
     J["base_url"] = base_url;
     J["model"] = model_name;
+    J["group_compress_model"] = group_compress_model;
     for (const std::string &u : key)
         J["keys"].append(u);
     for (const std::string &u : modes)
         J["mode"].append(u);
+    for (const std::string &u : wake_keywords)
+        J["wake_keywords"].append(u);
     J["black_list"] = parse_set_to_json(black_list);
     J["compress_summary_prompt"] = compress_summary_prompt;
+    J["group_context_summary_prompt"] = group_context_summary_prompt;
     J["compress_recent_rounds"] = compress_recent_rounds;
+    J["record_group_messages"] = record_group_messages;
+    J["reply_on_at"] = reply_on_at;
+    J["reply_on_keyword"] = reply_on_keyword;
+    J["group_context_keep_lines"] = group_context_keep_lines;
+    J["group_context_include_lines"] = group_context_include_lines;
+    J["group_context_show_time"] = group_context_show_time;
+    J["group_context_show_user_id"] = group_context_show_user_id;
+    J["active_context_show_time"] = active_context_show_time;
+    J["active_context_show_user_id"] = active_context_show_user_id;
     J["MAX_TOKEN"] = MAX_TOKEN;
     J["MAX_REPLY"] = MAX_REPLY;
     J["RED_LINE"] = RED_LINE;
@@ -159,6 +220,13 @@ bool isASCII(const std::string &s)
     return !std::any_of(s.begin(), s.end(), [](char c) {
         return static_cast<unsigned char>(c) > 127;
     });
+}
+
+static std::string json_context_line(const Json::Value &v)
+{
+    if (v.isString()) return v.asString();
+    if (v.isMember("content")) return v["content"].asString();
+    return trim(v.toStyledString());
 }
 
 std::string gpt3_5::do_black(std::string message)
@@ -248,6 +316,8 @@ void gpt3_5::save_history(int64_t id)
     Json::Value J;
     J["pre_prompt"] = pre_default[id];
     J["history"] = history[id];
+    J["group_recent"] = group_recent[id];
+    J["group_summary"] = group_summary[id];
     writefile(
         bot_config_path(nullptr, "gpt3_5/" + std::to_string(id) + ".json"),
         J.toStyledString());
@@ -378,6 +448,326 @@ bool gpt3_5::compress_history(int64_t id, size_t keyid, const msg_meta &conf,
 }
 
 
+std::string gpt3_5::get_cached_nickname(const msg_meta &conf)
+{
+    {
+        std::lock_guard<std::recursive_mutex> lock(data_lock);
+        auto it = nickname_cache.find(conf.user_id);
+        if (it != nickname_cache.end()) return it->second;
+    }
+
+    std::string nickname = "Unknown";
+    try {
+        nickname = get_stranger_name(conf.p, conf.user_id);
+    }
+    catch (...) {
+    }
+    if (trim(nickname).empty()) nickname = std::to_string(conf.user_id);
+
+    {
+        std::lock_guard<std::recursive_mutex> lock(data_lock);
+        nickname_cache[conf.user_id] = nickname;
+    }
+    return nickname;
+}
+
+std::string gpt3_5::get_short_time()
+{
+    std::time_t now = std::chrono::system_clock::to_time_t(
+        std::chrono::system_clock::now());
+    now += 8 * 3600;
+    tm tm_utc8_res = *std::gmtime(&now);
+    char time_buf[32] = "??/?? ??:??";
+    std::strftime(time_buf, sizeof(time_buf), "%m/%d %H:%M", &tm_utc8_res);
+    return time_buf;
+}
+
+std::string gpt3_5::simplify_cq_codes(const std::string &message, userid_t botqq)
+{
+    static const std::regex cq_regex(R"(\[CQ:([^,\]]+)([^\]]*)\])");
+    std::string result;
+    auto begin = std::sregex_iterator(message.begin(), message.end(), cq_regex);
+    auto end = std::sregex_iterator();
+    size_t last_pos = 0;
+    for (auto it = begin; it != end; ++it) {
+        std::smatch match = *it;
+        result += message.substr(last_pos, match.position() - last_pos);
+        std::string type = match[1].str();
+        std::string args = match[2].str();
+        if (type == "image") result += "[图片]";
+        else if (type == "record") result += "[语音]";
+        else if (type == "face") result += "[表情]";
+        else if (type == "video") result += "[视频]";
+        else if (type == "reply") result += "[回复]";
+        else if (type == "forward") result += "[转发]";
+        else if (type == "at") {
+            bool is_bot = false;
+            if (botqq != 0) {
+                std::string needle = "qq=" + std::to_string(botqq);
+                is_bot = args.find(needle) != std::string::npos;
+            }
+            result += is_bot ? "[@BOT]" : "[@某人]";
+        }
+        else result += "[" + type + "]";
+        last_pos = match.position() + match.length();
+    }
+    result += message.substr(last_pos);
+    std::replace(result.begin(), result.end(), '\n', ' ');
+    std::replace(result.begin(), result.end(), '\r', ' ');
+    return trim(result);
+}
+
+std::string gpt3_5::strip_bot_at(const std::string &message, const msg_meta &conf)
+{
+    std::string result = message;
+    userid_t botqq = conf.p->get_botqq();
+    try {
+        std::regex bot_at_regex("\\[CQ:at,qq=" + std::to_string(botqq) +
+                                R"((?:,[^\]]*)?\])");
+        result = std::regex_replace(result, bot_at_regex, "");
+    }
+    catch (...) {
+    }
+    return trim(result);
+}
+
+std::string gpt3_5::format_context_message(const std::string &message,
+                                           const msg_meta &conf,
+                                           const std::string &nickname,
+                                           bool active,
+                                           int64_t reply_id,
+                                           bool include_quote)
+{
+    bool show_id = active ? active_context_show_user_id
+                          : group_context_show_user_id;
+    bool show_time = active ? active_context_show_time
+                            : group_context_show_time;
+
+    std::string prefix = "[";
+    if (show_id) {
+        prefix += std::to_string(conf.user_id) + " (" + nickname + ")";
+    }
+    else {
+        prefix += nickname;
+    }
+    if (show_time) {
+        prefix += ", " + get_short_time();
+    }
+    prefix += "] ";
+
+    std::string body = simplify_cq_codes(message, conf.p->get_botqq());
+    std::string quoted;
+    if (include_quote && reply_id != -1) {
+        quoted = "引用：" + get_quoted_content(conf.p, reply_id) + " ";
+    }
+    return trim(prefix + quoted + body);
+}
+
+bool gpt3_5::message_mentions_bot(const std::string &message, const msg_meta &conf)
+{
+    std::string bot_at = "[CQ:at,qq=" + std::to_string(conf.p->get_botqq());
+    return message.find(bot_at) != std::string::npos;
+}
+
+bool gpt3_5::message_has_wake_keyword(const std::string &message)
+{
+    std::string lower_message = message;
+    std::transform(lower_message.begin(), lower_message.end(), lower_message.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    std::lock_guard<std::recursive_mutex> lock(data_lock);
+    for (std::string keyword : wake_keywords) {
+        keyword = trim(keyword);
+        if (keyword.empty()) continue;
+        std::transform(keyword.begin(), keyword.end(), keyword.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        if (lower_message.find(keyword) != std::string::npos) return true;
+    }
+    return false;
+}
+
+int64_t gpt3_5::estimate_text_tokens(const std::string &text)
+{
+    int64_t ascii_chars = 0;
+    int64_t non_ascii_codepoints = 0;
+    for (unsigned char c : text) {
+        if (c < 128) {
+            ++ascii_chars;
+        }
+        else if ((c & 0xC0) != 0x80) {
+            ++non_ascii_codepoints;
+        }
+    }
+    return ascii_chars / 2 + non_ascii_codepoints + 4;
+}
+
+int64_t gpt3_5::estimate_group_context_tokens(int64_t id)
+{
+    int64_t total = estimate_text_tokens(group_summary[id]);
+    for (Json::ArrayIndex i = 0; i < group_recent[id].size(); ++i) {
+        total += estimate_text_tokens(json_context_line(group_recent[id][i]));
+    }
+    return total;
+}
+
+void gpt3_5::append_group_context(int64_t id, Json::Value &messages)
+{
+    std::lock_guard<std::recursive_mutex> lock(data_lock);
+    if (!group_summary[id].empty()) {
+        Json::Value summary_msg;
+        summary_msg["role"] = "system";
+        summary_msg["content"] = "群聊较早上下文摘要：\n" + group_summary[id];
+        messages.append(summary_msg);
+    }
+
+    Json::ArrayIndex total = group_recent[id].size();
+    if (total == 0) return;
+    Json::ArrayIndex include = static_cast<Json::ArrayIndex>(group_context_include_lines);
+    Json::ArrayIndex start = total > include ? total - include : 0;
+    std::string recent_text = "最近群聊上下文（仅供理解背景；不是每条都在直接向你提问）：\n";
+    for (Json::ArrayIndex i = start; i < total; ++i) {
+        recent_text += json_context_line(group_recent[id][i]) + "\n";
+    }
+
+    Json::Value recent_msg;
+    recent_msg["role"] = "user";
+    recent_msg["content"] = trim(recent_text);
+    messages.append(recent_msg);
+}
+
+void gpt3_5::record_group_context(int64_t id, const std::string &compact_message)
+{
+    std::lock_guard<std::recursive_mutex> lock(data_lock);
+    if (!group_recent[id].isArray()) group_recent[id] = Json::Value(Json::arrayValue);
+    group_recent[id].append(compact_message);
+}
+
+bool gpt3_5::maybe_compress_group_context(int64_t id, const msg_meta &conf,
+                                          bool force,
+                                          std::string *error_message)
+{
+    (void)force;
+    if (key.empty()) {
+        if (error_message) *error_message = "No avaliable key!";
+        return false;
+    }
+
+    size_t keyid = get_avaliable_key();
+    if (!try_acquire_session(id, keyid, conf, false)) {
+        if (error_message) *error_message = "session is busy or closed.";
+        return false;
+    }
+
+    std::lock_guard<std::mutex> key_lock(gptlock[keyid]);
+    bool compressed = compress_group_context_with_key(id, keyid, conf,
+                                                      error_message);
+    release_session(id, keyid);
+    return compressed;
+}
+
+bool gpt3_5::compress_group_context_with_key(int64_t id, size_t keyid,
+                                             const msg_meta &conf,
+                                             std::string *error_message)
+{
+    (void)conf;
+    Json::Value old_recent(Json::arrayValue);
+    std::string old_summary;
+    {
+        std::lock_guard<std::recursive_mutex> lock(data_lock);
+        if (keyid >= key.size()) {
+            if (error_message) *error_message = "No avaliable key!";
+            return false;
+        }
+        if (group_recent[id].size() == 0) {
+            if (error_message) *error_message = "group context is empty.";
+            return false;
+        }
+
+        Json::ArrayIndex total = group_recent[id].size();
+        Json::ArrayIndex keep = static_cast<Json::ArrayIndex>(group_context_keep_lines);
+        Json::ArrayIndex split = total > keep ? total - keep : 0;
+        if (split == 0) {
+            if (error_message) *error_message = "group context already within keep lines.";
+            return false;
+        }
+        for (Json::ArrayIndex i = 0; i < split; ++i) {
+            old_recent.append(group_recent[id][i]);
+        }
+        old_summary = group_summary[id];
+    }
+
+    std::string recent_text;
+    for (Json::ArrayIndex i = 0; i < old_recent.size(); ++i) {
+        recent_text += json_context_line(old_recent[i]) + "\n";
+    }
+
+    Json::Value req;
+    req["model"] = group_compress_model.empty() ? model_name : group_compress_model;
+    req["temperature"] = 0.2;
+    req["max_tokens"] = MAX_REPLY;
+
+    Json::Value messages(Json::arrayValue);
+    Json::Value sys_msg;
+    sys_msg["role"] = "system";
+    sys_msg["content"] = "你是群聊上下文压缩器。请把群聊记录压缩成给聊天机器人延续对话用的摘要，保留话题、人物关系、语气、未解决问题和之后可能会被引用的信息。";
+    messages.append(sys_msg);
+
+    Json::Value user_msg;
+    user_msg["role"] = "user";
+    user_msg["content"] = "已有摘要：\n" +
+                          (old_summary.empty() ? std::string("（无）") : old_summary) +
+                          "\n\n新增群聊记录：\n" + trim(recent_text) +
+                          "\n\n" + group_context_summary_prompt;
+    messages.append(user_msg);
+    req["messages"] = messages;
+
+    Json::Value resp;
+    try {
+        resp = string_to_json(do_post(base_url, "/v1/chat/completions", false,
+                                      req,
+                                      {{"Content-Type", "application/json"},
+                                       {"Authorization", "Bearer " + key[keyid]}},
+                                      true));
+    }
+    catch (std::string e) {
+        if (error_message) *error_message = e;
+        return false;
+    }
+    catch (...) {
+        if (error_message) *error_message = "http connection failed.";
+        return false;
+    }
+
+    if (resp.isMember("error")) {
+        if (error_message) *error_message = resp["error"]["message"].asString();
+        return false;
+    }
+    if (!resp.isMember("choices") || !resp["choices"].isArray() ||
+        resp["choices"].empty()) {
+        if (error_message) *error_message = "group summary response format invalid";
+        return false;
+    }
+
+    std::string summary = trim(resp["choices"][0]["message"]["content"].asString());
+    if (summary.empty()) {
+        if (error_message) *error_message = "group summary is empty";
+        return false;
+    }
+
+    {
+        std::lock_guard<std::recursive_mutex> lock(data_lock);
+        Json::Value new_recent(Json::arrayValue);
+        Json::ArrayIndex total = group_recent[id].size();
+        Json::ArrayIndex keep = static_cast<Json::ArrayIndex>(group_context_keep_lines);
+        Json::ArrayIndex start = total > keep ? total - keep : 0;
+        for (Json::ArrayIndex i = start; i < total; ++i) {
+            new_recent.append(group_recent[id][i]);
+        }
+        group_summary[id] = summary;
+        group_recent[id] = new_recent;
+    }
+    return true;
+}
+
 std::string gpt3_5::get_quoted_content(const bot *p, int64_t reply_id, int depth)
 {
     if (depth > 5) return "...(too deep)";
@@ -472,6 +862,7 @@ std::string gpt3_5::get_quoted_content(const bot *p, int64_t reply_id, int depth
         uid = msg_data["sender"]["user_id"].asUInt64();
     }
 
+    content = simplify_cq_codes(content, p->get_botqq());
     if (uid != 0) {
         return "[" + nickname + "(" + std::to_string(uid) + ")]：" + content;
     }
@@ -556,6 +947,8 @@ std::string gpt3_5::expand_forward_content(const bot *p, const std::string &forw
 
 void gpt3_5::process(std::string message, const msg_meta &conf)
 {
+    if (conf.user_id == conf.p->get_botqq()) return;
+
     int64_t reply_id = -1;
     if (starts_with(message, "[CQ:reply,id=")) {
         size_t id_start = 13;
@@ -583,11 +976,51 @@ void gpt3_5::process(std::string message, const msg_meta &conf)
         return;
     }
 
-    if (!starts_with(message, ".ai")) {
+    int64_t id = conf.message_type == "group" ? (conf.group_id << 1)
+                                              : ((conf.user_id << 1) | 1);
+    {
+        std::lock_guard<std::recursive_mutex> lock(data_lock);
+        if (pre_default.find(id) == pre_default.end() || pre_default[id].empty()) {
+            pre_default[id] = default_prompt;
+        }
+    }
+
+    std::string nickname = get_cached_nickname(conf);
+    bool is_group = conf.message_type == "group";
+    bool at_mentioned = is_group && message_mentions_bot(message, conf);
+    bool keyword_mentioned = is_group && message_has_wake_keyword(message);
+
+    std::string working_message = message;
+    if (at_mentioned) {
+        working_message = strip_bot_at(working_message, conf);
+    }
+
+    bool explicit_ai = starts_with(working_message, ".ai");
+    bool should_reply = explicit_ai || (reply_on_at && at_mentioned) ||
+                        (reply_on_keyword && keyword_mentioned) || !is_group;
+
+    if (!should_reply) {
+        if (is_group && record_group_messages) {
+            std::string compact = format_context_message(message, conf, nickname,
+                                                         false, reply_id, false);
+            if (!compact.empty()) {
+                record_group_context(id, compact);
+                save_history(id);
+            }
+        }
         return;
     }
 
-    message = do_black(trim(message.substr(3)));
+    if (explicit_ai) {
+        message = trim(working_message.substr(3));
+    }
+    else {
+        message = trim(working_message);
+    }
+    message = do_black(message);
+    if (!explicit_ai && at_mentioned && trim(message).empty()) {
+        message = "（对方只 @ 了你，没有输入文字。请根据最近群聊上下文简短回应。）";
+    }
 
     std::istringstream iss(message);
     std::string command;
@@ -595,9 +1028,6 @@ void gpt3_5::process(std::string message, const msg_meta &conf)
     std::string args;
     getline(iss, args);
     args = trim(args);
-
-    int64_t id = conf.message_type == "group" ? (conf.group_id << 1)
-                                              : ((conf.user_id << 1) | 1);
 
     {
         std::lock_guard<std::recursive_mutex> lock(data_lock);
@@ -647,6 +1077,8 @@ void gpt3_5::process(std::string message, const msg_meta &conf)
             {
                 std::lock_guard<std::recursive_mutex> lock(data_lock);
                 history[id].clear();
+                group_recent[id].clear();
+                group_summary[id].clear();
             }
             save_history(id);
             conf.p->cq_send("reset done.", conf);
@@ -671,6 +1103,23 @@ void gpt3_5::process(std::string message, const msg_meta &conf)
              }
              else {
                  conf.p->cq_send(compress_error.empty() ? "compress failed." : compress_error,
+                                 conf);
+             }
+             return true;
+         }},
+        {".gcompress",
+         [&]() {
+             std::string compress_error;
+             bool compressed = maybe_compress_group_context(id, conf, true,
+                                                            &compress_error);
+             if (compressed) {
+                 save_history(id);
+                 conf.p->cq_send("group context compress done.", conf);
+             }
+             else {
+                 conf.p->cq_send(compress_error.empty() ?
+                                     "group context compress skipped." :
+                                     compress_error,
                                  conf);
              }
              return true;
@@ -740,6 +1189,79 @@ void gpt3_5::process(std::string message, const msg_meta &conf)
             conf.p->cq_send("is_debug: " + std::to_string(new_state), conf);
             return true;
         }},
+        {".record",
+        [&]() {
+            std::string reply;
+            bool do_save = false;
+            {
+                std::lock_guard<std::recursive_mutex> lock(data_lock);
+                if (!conf.p->is_op(conf.user_id)) {
+                    reply = "Not on op list.";
+                }
+                else if (args.empty()) {
+                    reply = "record_group_messages: " +
+                            std::to_string(record_group_messages);
+                }
+                else {
+                    std::istringstream arg_iss(args);
+                    int64_t num = 0;
+                    if (!(arg_iss >> num) || (num != 0 && num != 1)) {
+                        reply = "用法: .ai.record 0|1";
+                    }
+                    else {
+                        record_group_messages = (num != 0);
+                        reply = "set record_group_messages to " +
+                                std::to_string(record_group_messages);
+                        do_save = true;
+                    }
+                }
+            }
+            conf.p->cq_send(reply, conf);
+            if (do_save) save_file();
+            return true;
+        }},
+        {".awake",
+        [&]() {
+            std::string reply;
+            bool do_save = false;
+            {
+                std::lock_guard<std::recursive_mutex> lock(data_lock);
+                if (!conf.p->is_op(conf.user_id)) {
+                    reply = "Not on op list.";
+                }
+                else if (args.empty()) {
+                    reply = "reply_on_at: " + std::to_string(reply_on_at) +
+                            "\nreply_on_keyword: " +
+                            std::to_string(reply_on_keyword);
+                }
+                else {
+                    std::istringstream arg_iss(args);
+                    std::string type;
+                    int64_t num = 0;
+                    if (!(arg_iss >> type >> num) || (num != 0 && num != 1)) {
+                        reply = "用法: .ai.awake at|keyword 0|1";
+                    }
+                    else if (type == "at") {
+                        reply_on_at = (num != 0);
+                        reply = "set reply_on_at to " +
+                                std::to_string(reply_on_at);
+                        do_save = true;
+                    }
+                    else if (type == "keyword") {
+                        reply_on_keyword = (num != 0);
+                        reply = "set reply_on_keyword to " +
+                                std::to_string(reply_on_keyword);
+                        do_save = true;
+                    }
+                    else {
+                        reply = "用法: .ai.awake at|keyword 0|1";
+                    }
+                }
+            }
+            conf.p->cq_send(reply, conf);
+            if (do_save) save_file();
+            return true;
+        }},
         {".set",
         [&]() {
             std::string reply = "Not on op list.";
@@ -770,6 +1292,22 @@ void gpt3_5::process(std::string message, const msg_meta &conf)
                         } else {
                             compress_recent_rounds = static_cast<int>(num);
                             reply = "set compress_recent_rounds to " + std::to_string(num);
+                            do_save = true;
+                        }
+                    } else if (type == "gkeep") {
+                        if (num < 1) {
+                            reply = "group_context_keep_lines must be >= 1";
+                        } else {
+                            group_context_keep_lines = static_cast<int>(num);
+                            reply = "set group_context_keep_lines to " + std::to_string(num);
+                            do_save = true;
+                        }
+                    } else if (type == "ginclude") {
+                        if (num < 1) {
+                            reply = "group_context_include_lines must be >= 1";
+                        } else {
+                            group_context_include_lines = static_cast<int>(num);
+                            reply = "set group_context_include_lines to " + std::to_string(num);
                             do_save = true;
                         }
                     } else {
@@ -810,7 +1348,24 @@ void gpt3_5::process(std::string message, const msg_meta &conf)
                          std::to_string(last_total_tokens[id]) + "\n";
                 reply += "history message count: " +
                          std::to_string(history[id].size()) + "\n";
-                reply += "note: context will be conpressed when prompt_tokens > compress threshold, context will be conpressed when prompt_tokens > trim threshold";
+                reply += "record_group_messages: " +
+                         std::to_string(record_group_messages) + "\n";
+                reply += "reply_on_at: " + std::to_string(reply_on_at) + "\n";
+                reply += "reply_on_keyword: " +
+                         std::to_string(reply_on_keyword) + "\n";
+                reply += "group compress model: " +
+                         (group_compress_model.empty() ? model_name : group_compress_model) + "\n";
+                reply += "group recent lines: " +
+                         std::to_string(group_recent[id].size()) + "\n";
+                reply += "group summary estimated tokens: " +
+                         std::to_string(estimate_text_tokens(group_summary[id])) + "\n";
+                reply += "group context estimated tokens: " +
+                         std::to_string(estimate_group_context_tokens(id)) + "\n";
+                reply += "group_context_keep_lines: " +
+                         std::to_string(group_context_keep_lines) + "\n";
+                reply += "group_context_include_lines: " +
+                         std::to_string(group_context_include_lines) + "\n";
+                reply += "note: passive group context is compressed only before active replies or manual .gcompress; request order is prompt -> active history -> group summary -> recent group -> current user";
             }
             conf.p->cq_send(reply, conf);
             return true;
@@ -820,6 +1375,10 @@ void gpt3_5::process(std::string message, const msg_meta &conf)
     bool handled = false;
     (void)cmd_try_dispatch(command, exact_rules, {}, handled);
     if (handled) {
+        return;
+    }
+
+    if (!explicit_ai && trim(message).empty()) {
         return;
     }
 
@@ -834,23 +1393,32 @@ void gpt3_5::process(std::string message, const msg_meta &conf)
     std::lock_guard<std::mutex> lock(gptlock[keyid]);
     Json::Value J, user_input_J, ign;
     user_input_J["role"] = "user";
-    std::string nickname = get_stranger_name(conf.p, conf.user_id);
-
-    std::time_t now = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
-    now += 8 * 3600;
-    tm tm_utc8_res = *std::gmtime(&now);
-    char time_buf[64] = "Unknown time";
-    std::strftime(time_buf, sizeof(time_buf), "%Y/%m/%d %H:%M:%S", &tm_utc8_res);
-
-    std::string prompt_content = "[User: " + std::to_string(conf.user_id) + " (" +
-                                 nickname + ")] [Time: " + std::string(time_buf) + "]";
-    if (reply_id != -1) {
-        prompt_content += " [CQ:reply,id=" + std::to_string(reply_id) + "] 引用聊天记录：" + get_quoted_content(conf.p, reply_id);
-    }
-    prompt_content += " 正文：" + message;
+    std::string prompt_content = format_context_message(message, conf, nickname,
+                                                        true, reply_id, true);
     user_input_J["content"] = prompt_content;
 
     J["model"] = model_name;
+
+    if (is_group && record_group_messages) {
+        std::string compress_error;
+        bool compressed = compress_group_context_with_key(id, keyid, conf,
+                                                          &compress_error);
+        if (compressed) {
+            save_history(id);
+            if (is_debug) {
+                conf.p->setlog(LOG::INFO,
+                               "openai: group context compressed before reply for " +
+                                   std::to_string(id));
+            }
+        }
+        else if (!compress_error.empty() &&
+                 compress_error != "group context already within keep lines." &&
+                 is_debug) {
+            conf.p->setlog(LOG::INFO,
+                           "openai: group context compress before reply skipped: " +
+                               compress_error);
+        }
+    }
     
     {
         std::unique_lock<std::recursive_mutex> lock_data(data_lock);
@@ -885,6 +1453,9 @@ void gpt3_5::process(std::string message, const msg_meta &conf)
         Json::ArrayIndex sz = h.size();
         for (Json::ArrayIndex i = 0; i < sz; i++) {
             K.append(h[i]);
+        }
+        if (is_group && record_group_messages) {
+            append_group_context(id, K);
         }
         K.append(user_input_J);
         J["messages"] = K;
@@ -1025,7 +1596,7 @@ void gpt3_5::process(std::string message, const msg_meta &conf)
 
 bool gpt3_5::check(std::string message, const msg_meta &conf)
 {
-    (void)conf;
+    if (conf.user_id == conf.p->get_botqq()) return false;
     if (starts_with(message, "[CQ:reply,id=")) {
         size_t pos = message.find(']');
         if (pos != std::string::npos) {
@@ -1033,6 +1604,12 @@ bool gpt3_5::check(std::string message, const msg_meta &conf)
         }
     }
     if (cmd_match_exact(message, {"你说的话我不喜欢"})) {
+        return true;
+    }
+    if (conf.message_type == "group" &&
+        (record_group_messages ||
+         (reply_on_at && message_mentions_bot(message, conf)) ||
+         (reply_on_keyword && message_has_wake_keyword(message)))) {
         return true;
     }
     return cmd_match_prefix(message, {".ai"});
@@ -1045,12 +1622,15 @@ std::string gpt3_5::help()
            ".ai.reset - 重置当前对话上下文\n"
            ".ai.status - 查看当前实际生效的模型/阈值/历史长度估算\n"
            ".ai.compress - 压缩旧上下文并保留最近对话\n"
+           ".ai.gcompress - 手动压缩群聊旁听上下文\n"
            ".ai.change [模式] - 切换提示词模式\n"
            ".ai.arc - 手动归档当前上下文\n"
            ".ai.arc list [页码] - 查看归档列表（每页5条）\n"
            ".ai.arc restore [编号/文件名] - 从归档中恢复上下文\n"
            ".ai.sw - 仅 OP 可用, 关闭模型作维护用\n"
-           ".ai.set reply/token/red/compress [数值] - 修改 MAX_REPLY/MAX_TOKEN/RED_LINE/compress_recent_rounds\n"
+           ".ai.record 0|1 - 切换是否旁听并保存普通群消息\n"
+           ".ai.awake at/keyword 0|1 - 切换 @bot/设置的 wake 关键词是否触发回复\n"
+           ".ai.set reply/token/red/compress/gkeep/ginclude [数值] - 修改回复、主上下文和群聊旁听保留/带入条数\n"
            "权限说明：归档与恢复功能在群聊中需 OP权限，私聊可直接使用。";
 }
 
@@ -1113,6 +1693,8 @@ void gpt3_5::perform_archive(int64_t id, const msg_meta &conf, bool is_auto,
         std::lock_guard<std::recursive_mutex> lock(data_lock);
         J["pre_prompt"] = pre_default[id];
         J["history"] = history[id];
+        J["group_recent"] = group_recent[id];
+        J["group_summary"] = group_summary[id];
         writefile(full_path, J.toStyledString());
     }
 
@@ -1227,6 +1809,12 @@ void gpt3_5::restore_archive(int64_t id, const msg_meta &conf,
             std::lock_guard<std::recursive_mutex> lock(data_lock);
             history[id] = J["history"];
             pre_default[id] = J["pre_prompt"].asString();
+            if (J.isMember("group_recent") && J["group_recent"].isArray()) {
+                group_recent[id] = J["group_recent"];
+            }
+            if (J.isMember("group_summary")) {
+                group_summary[id] = J["group_summary"].asString();
+            }
         }
         save_history(id);
         conf.p->cq_send("归档 " + target_file + " 已成功恢复。", conf);
