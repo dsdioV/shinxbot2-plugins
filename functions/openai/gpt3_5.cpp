@@ -240,6 +240,17 @@ static std::string json_context_line(const Json::Value &v)
     return trim(v.toStyledString());
 }
 
+static bool json_array_starts_with(const Json::Value &value,
+                                   const Json::Value &prefix)
+{
+    if (!value.isArray() || !prefix.isArray()) return false;
+    if (value.size() < prefix.size()) return false;
+    for (Json::ArrayIndex i = 0; i < prefix.size(); ++i) {
+        if (value[i] != prefix[i]) return false;
+    }
+    return true;
+}
+
 std::string gpt3_5::do_black(std::string message)
 {
     std::lock_guard<std::recursive_mutex> lock(data_lock);
@@ -298,10 +309,6 @@ bool gpt3_5::try_acquire_session(int64_t id, size_t keyid, const msg_meta &conf,
         conf.p->cq_send("请等待其他对话中输入的回复。", conf);
         return false;
     }
-    if (active_ids.count(id)) {
-        conf.p->cq_send("请等待该对话中上一个输入的回复。", conf);
-        return false;
-    }
     if (!is_open) {
         conf.p->cq_send("已关闭。" + close_message, conf);
         return false;
@@ -310,15 +317,13 @@ bool gpt3_5::try_acquire_session(int64_t id, size_t keyid, const msg_meta &conf,
         pre_default[id] = default_prompt;
     }
     is_lock[keyid] = true;
-    active_ids.insert(id);
     return true;
 }
 
-void gpt3_5::release_session(int64_t id, size_t keyid)
+void gpt3_5::release_session(size_t keyid)
 {
     std::lock_guard<std::recursive_mutex> lock(data_lock);
     is_lock[keyid] = false;
-    active_ids.erase(id);
 }
 
 void gpt3_5::save_history(int64_t id)
@@ -449,6 +454,17 @@ bool gpt3_5::compress_history(int64_t id, size_t keyid, const msg_meta &conf,
 
     {
         std::lock_guard<std::recursive_mutex> lock(data_lock);
+        Json::Value tail(Json::arrayValue);
+        if (!json_array_starts_with(history[id], old_history)) {
+            if (error_message) *error_message = "history changed while compressing.";
+            return false;
+        }
+        for (Json::ArrayIndex i = old_history.size(); i < history[id].size(); ++i) {
+            tail.append(history[id][i]);
+        }
+        for (Json::ArrayIndex i = 0; i < tail.size(); ++i) {
+            new_history.append(tail[i]);
+        }
         history[id] = new_history;
         last_prompt_tokens[id] = 0;
         if (pre_default.find(id) == pre_default.end()) {
@@ -681,7 +697,7 @@ bool gpt3_5::maybe_compress_group_context(int64_t id, const msg_meta &conf,
     std::lock_guard<std::mutex> key_lock(gptlock[keyid]);
     bool compressed = compress_group_context_with_key(id, keyid, conf, force,
                                                       error_message);
-    release_session(id, keyid);
+    release_session(keyid);
     return compressed;
 }
 
@@ -691,8 +707,10 @@ bool gpt3_5::compress_group_context_with_key(int64_t id, size_t keyid,
                                              std::string *error_message)
 {
     (void)conf;
+    Json::Value snapshot_recent(Json::arrayValue);
     Json::Value old_recent(Json::arrayValue);
     std::string old_summary;
+    Json::ArrayIndex split_idx = 0;
     {
         std::lock_guard<std::recursive_mutex> lock(data_lock);
         if (keyid >= key.size()) {
@@ -721,8 +739,10 @@ bool gpt3_5::compress_group_context_with_key(int64_t id, size_t keyid,
             if (error_message) *error_message = "group context already within keep lines.";
             return false;
         }
+        snapshot_recent = group_recent[id];
+        split_idx = split;
         for (Json::ArrayIndex i = 0; i < split; ++i) {
-            old_recent.append(group_recent[id][i]);
+            old_recent.append(snapshot_recent[i]);
         }
         old_summary = group_summary[id];
     }
@@ -787,11 +807,15 @@ bool gpt3_5::compress_group_context_with_key(int64_t id, size_t keyid,
 
     {
         std::lock_guard<std::recursive_mutex> lock(data_lock);
+        if (!json_array_starts_with(group_recent[id], snapshot_recent)) {
+            if (error_message) *error_message = "group context changed while compressing.";
+            return false;
+        }
         Json::Value new_recent(Json::arrayValue);
-        Json::ArrayIndex total = group_recent[id].size();
-        Json::ArrayIndex keep = static_cast<Json::ArrayIndex>(group_context_keep_lines);
-        Json::ArrayIndex start = total > keep ? total - keep : 0;
-        for (Json::ArrayIndex i = start; i < total; ++i) {
+        for (Json::ArrayIndex i = split_idx; i < snapshot_recent.size(); ++i) {
+            new_recent.append(snapshot_recent[i]);
+        }
+        for (Json::ArrayIndex i = snapshot_recent.size(); i < group_recent[id].size(); ++i) {
             new_recent.append(group_recent[id][i]);
         }
         group_summary[id] = summary;
@@ -1128,7 +1152,7 @@ void gpt3_5::process(std::string message, const msg_meta &conf)
              std::lock_guard<std::mutex> compress_lock(gptlock[compress_keyid]);
              std::string compress_error;
              bool compressed = compress_history(id, compress_keyid, conf, &compress_error);
-             release_session(id, compress_keyid);
+             release_session(compress_keyid);
              if (compressed) {
                  save_history(id);
                  conf.p->cq_send("compress done.", conf);
@@ -1603,7 +1627,7 @@ void gpt3_5::process(std::string message, const msg_meta &conf)
     conf.p->setlog(LOG::INFO, "openai: user " + std::to_string(conf.user_id));
     
     {
-        release_session(id, keyid);
+        release_session(keyid);
     }
 
     if (J.isMember("error")) {
@@ -1629,10 +1653,6 @@ void gpt3_5::process(std::string message, const msg_meta &conf)
             J["choices"].empty()) {
             conf.p->cq_send("Openai ERROR: API 响应格式异常(缺少 choices)",
                             conf);
-            {
-                std::lock_guard<std::recursive_mutex> lock_data(data_lock);
-                active_ids.erase(id);
-            }
             return;
         }
 
@@ -1646,10 +1666,6 @@ void gpt3_5::process(std::string message, const msg_meta &conf)
                 conf.p->cq_send("QAQ 响应被 OpenAI 安全策略过滤了", conf);
             } else {
                 conf.p->cq_send("API空返回！", conf);
-            }
-            {
-                std::lock_guard<std::recursive_mutex> lock_data(data_lock);
-                active_ids.erase(id);
             }
             return;
         }

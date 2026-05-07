@@ -25,7 +25,6 @@ private:
     std::map<int64_t, int64_t> last_total_tokens;
     std::vector<std::string> modes;
     std::set<std::string> black_list;
-    std::set<int64_t> active_ids;
     std::map<std::string, Json::Value> mode_prompt;
     std::vector<std::string> key;
     std::vector<std::string> wake_keywords;
@@ -75,7 +74,7 @@ private:
                                       std::string *error_message = nullptr);
     bool try_acquire_session(int64_t id, size_t keyid, const msg_meta &conf,
                              bool ensure_default_prompt = true);
-    void release_session(int64_t id, size_t keyid);
+    void release_session(size_t keyid);
     bool compress_history(int64_t id, size_t keyid, const msg_meta &conf,
                           std::string *error_message = nullptr);
     void fallback_trim_history(int64_t id, int rounds = 1);
