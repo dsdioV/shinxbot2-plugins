@@ -42,8 +42,11 @@ private:
     bool group_context_show_user_id = false;
     bool active_context_show_time = true;
     bool active_context_show_user_id = true;
+    bool group_context_use_summary = true;
     int group_context_keep_lines = 10;
     int group_context_include_lines = 10;
+    int group_context_auto_compress_lines = 80;
+    int group_context_max_recent_lines = 200;
     std::string get_quoted_content(const bot *p, int64_t reply_id, int depth = 0);
     std::string expand_forward_content(const bot *p, const std::string &forward_id, int depth);
     std::string get_cached_nickname(const msg_meta &conf);
@@ -60,10 +63,12 @@ private:
     bool message_has_wake_keyword(const std::string &message);
     int64_t estimate_text_tokens(const std::string &text);
     int64_t estimate_group_context_tokens(int64_t id);
-    void append_group_context(int64_t id, Json::Value &messages);
+    void append_group_summary_context(int64_t id, Json::Value &messages);
+    void append_group_recent_context(int64_t id, Json::Value &messages);
     void record_group_context(int64_t id, const std::string &compact_message);
     bool compress_group_context_with_key(int64_t id, size_t keyid,
                                          const msg_meta &conf,
+                                         bool force = false,
                                          std::string *error_message = nullptr);
     bool maybe_compress_group_context(int64_t id, const msg_meta &conf,
                                       bool force = false,

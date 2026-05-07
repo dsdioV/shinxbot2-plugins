@@ -65,8 +65,11 @@ gpt3_5::gpt3_5()
               "\"reply_on_keyword\": false,"
               "\"wake_keywords\": [\"bot\", \"猫猫\"],"
               "\"group_compress_model\": \"deepseek-v4-flash\","
+              "\"group_context_use_summary\": true,"
               "\"group_context_keep_lines\": 10,"
               "\"group_context_include_lines\": 10,"
+              "\"group_context_auto_compress_lines\": 80,"
+              "\"group_context_max_recent_lines\": 200,"
               "\"group_context_show_time\": true,"
               "\"group_context_show_user_id\": false,"
               "\"active_context_show_time\": true,"
@@ -117,14 +120,19 @@ gpt3_5::gpt3_5()
     record_group_messages = res.get("record_group_messages", true).asBool();
     reply_on_at = res.get("reply_on_at", true).asBool();
     reply_on_keyword = res.get("reply_on_keyword", false).asBool();
+    group_context_use_summary = res.get("group_context_use_summary", true).asBool();
     group_context_keep_lines = res.get("group_context_keep_lines", 10).asInt();
     group_context_include_lines = res.get("group_context_include_lines", 10).asInt();
+    group_context_auto_compress_lines = res.get("group_context_auto_compress_lines", 80).asInt();
+    group_context_max_recent_lines = res.get("group_context_max_recent_lines", 200).asInt();
     group_context_show_time = res.get("group_context_show_time", true).asBool();
     group_context_show_user_id = res.get("group_context_show_user_id", false).asBool();
     active_context_show_time = res.get("active_context_show_time", true).asBool();
     active_context_show_user_id = res.get("active_context_show_user_id", true).asBool();
     if (group_context_keep_lines < 1) group_context_keep_lines = 1;
-    if (group_context_include_lines < 1) group_context_include_lines = 1;
+    if (group_context_include_lines < 0) group_context_include_lines = 0;
+    if (group_context_auto_compress_lines < 0) group_context_auto_compress_lines = 0;
+    if (group_context_max_recent_lines < 1) group_context_max_recent_lines = 1;
     if (res.isMember("wake_keywords") && res["wake_keywords"].isArray()) {
         for (Json::ArrayIndex i = 0; i < res["wake_keywords"].size(); ++i) {
             std::string keyword = trim(res["wake_keywords"][i].asString());
@@ -188,8 +196,11 @@ void gpt3_5::save_file()
     J["record_group_messages"] = record_group_messages;
     J["reply_on_at"] = reply_on_at;
     J["reply_on_keyword"] = reply_on_keyword;
+    J["group_context_use_summary"] = group_context_use_summary;
     J["group_context_keep_lines"] = group_context_keep_lines;
     J["group_context_include_lines"] = group_context_include_lines;
+    J["group_context_auto_compress_lines"] = group_context_auto_compress_lines;
+    J["group_context_max_recent_lines"] = group_context_max_recent_lines;
     J["group_context_show_time"] = group_context_show_time;
     J["group_context_show_user_id"] = group_context_show_user_id;
     J["active_context_show_time"] = active_context_show_time;
@@ -609,18 +620,22 @@ int64_t gpt3_5::estimate_group_context_tokens(int64_t id)
     return total;
 }
 
-void gpt3_5::append_group_context(int64_t id, Json::Value &messages)
+void gpt3_5::append_group_summary_context(int64_t id, Json::Value &messages)
 {
     std::lock_guard<std::recursive_mutex> lock(data_lock);
-    if (!group_summary[id].empty()) {
+    if (group_context_use_summary && !group_summary[id].empty()) {
         Json::Value summary_msg;
         summary_msg["role"] = "system";
         summary_msg["content"] = "群聊较早上下文摘要：\n" + group_summary[id];
         messages.append(summary_msg);
     }
+}
 
+void gpt3_5::append_group_recent_context(int64_t id, Json::Value &messages)
+{
+    std::lock_guard<std::recursive_mutex> lock(data_lock);
     Json::ArrayIndex total = group_recent[id].size();
-    if (total == 0) return;
+    if (total == 0 || group_context_include_lines == 0) return;
     Json::ArrayIndex include = static_cast<Json::ArrayIndex>(group_context_include_lines);
     Json::ArrayIndex start = total > include ? total - include : 0;
     std::string recent_text = "最近群聊上下文（仅供理解背景；不是每条都在直接向你提问）：\n";
@@ -639,13 +654,19 @@ void gpt3_5::record_group_context(int64_t id, const std::string &compact_message
     std::lock_guard<std::recursive_mutex> lock(data_lock);
     if (!group_recent[id].isArray()) group_recent[id] = Json::Value(Json::arrayValue);
     group_recent[id].append(compact_message);
+    if (!group_context_use_summary && group_context_max_recent_lines > 0) {
+        Json::Value ign;
+        Json::ArrayIndex max_recent = static_cast<Json::ArrayIndex>(group_context_max_recent_lines);
+        while (group_recent[id].size() > max_recent) {
+            group_recent[id].removeIndex(0, &ign);
+        }
+    }
 }
 
 bool gpt3_5::maybe_compress_group_context(int64_t id, const msg_meta &conf,
                                           bool force,
                                           std::string *error_message)
 {
-    (void)force;
     if (key.empty()) {
         if (error_message) *error_message = "No avaliable key!";
         return false;
@@ -658,7 +679,7 @@ bool gpt3_5::maybe_compress_group_context(int64_t id, const msg_meta &conf,
     }
 
     std::lock_guard<std::mutex> key_lock(gptlock[keyid]);
-    bool compressed = compress_group_context_with_key(id, keyid, conf,
+    bool compressed = compress_group_context_with_key(id, keyid, conf, force,
                                                       error_message);
     release_session(id, keyid);
     return compressed;
@@ -666,6 +687,7 @@ bool gpt3_5::maybe_compress_group_context(int64_t id, const msg_meta &conf,
 
 bool gpt3_5::compress_group_context_with_key(int64_t id, size_t keyid,
                                              const msg_meta &conf,
+                                             bool force,
                                              std::string *error_message)
 {
     (void)conf;
@@ -684,6 +706,16 @@ bool gpt3_5::compress_group_context_with_key(int64_t id, size_t keyid,
 
         Json::ArrayIndex total = group_recent[id].size();
         Json::ArrayIndex keep = static_cast<Json::ArrayIndex>(group_context_keep_lines);
+        Json::ArrayIndex auto_lines = static_cast<Json::ArrayIndex>(group_context_auto_compress_lines);
+        Json::ArrayIndex auto_threshold = keep + auto_lines;
+        if (!force && !group_context_use_summary) {
+            if (error_message) *error_message = "group summary disabled; auto compression skipped.";
+            return false;
+        }
+        if (!force && total <= auto_threshold) {
+            if (error_message) *error_message = "group context below auto compress threshold.";
+            return false;
+        }
         Json::ArrayIndex split = total > keep ? total - keep : 0;
         if (split == 0) {
             if (error_message) *error_message = "group context already within keep lines.";
@@ -1220,6 +1252,48 @@ void gpt3_5::process(std::string message, const msg_meta &conf)
             if (do_save) save_file();
             return true;
         }},
+        {".summary",
+        [&]() {
+            std::string reply;
+            bool do_save = false;
+            bool do_save_history = false;
+            {
+                std::lock_guard<std::recursive_mutex> lock(data_lock);
+                if (!conf.p->is_op(conf.user_id)) {
+                    reply = "Not on op list.";
+                }
+                else if (args.empty()) {
+                    reply = "group_context_use_summary: " +
+                            std::to_string(group_context_use_summary);
+                }
+                else {
+                    std::istringstream arg_iss(args);
+                    int64_t num = 0;
+                    if (!(arg_iss >> num) || (num != 0 && num != 1)) {
+                        reply = "用法: .ai.summary 0|1";
+                    }
+                    else {
+                        group_context_use_summary = (num != 0);
+                        reply = "set group_context_use_summary to " +
+                                std::to_string(group_context_use_summary);
+                        if (!group_context_use_summary) {
+                            Json::Value ign;
+                            Json::ArrayIndex max_recent =
+                                static_cast<Json::ArrayIndex>(group_context_max_recent_lines);
+                            while (group_recent[id].size() > max_recent) {
+                                group_recent[id].removeIndex(0, &ign);
+                            }
+                            do_save_history = true;
+                        }
+                        do_save = true;
+                    }
+                }
+            }
+            conf.p->cq_send(reply, conf);
+            if (do_save) save_file();
+            if (do_save_history) save_history(id);
+            return true;
+        }},
         {".awake",
         [&]() {
             std::string reply;
@@ -1266,6 +1340,7 @@ void gpt3_5::process(std::string message, const msg_meta &conf)
         [&]() {
             std::string reply = "Not on op list.";
             bool do_save = false;
+            bool do_save_history = false;
             {
                 std::lock_guard<std::recursive_mutex> lock(data_lock);
                 if (conf.p->is_op(conf.user_id)) {
@@ -1303,11 +1378,36 @@ void gpt3_5::process(std::string message, const msg_meta &conf)
                             do_save = true;
                         }
                     } else if (type == "ginclude") {
-                        if (num < 1) {
-                            reply = "group_context_include_lines must be >= 1";
+                        if (num < 0) {
+                            reply = "group_context_include_lines must be >= 0";
                         } else {
                             group_context_include_lines = static_cast<int>(num);
                             reply = "set group_context_include_lines to " + std::to_string(num);
+                            do_save = true;
+                        }
+                    } else if (type == "gauto") {
+                        if (num < 0) {
+                            reply = "group_context_auto_compress_lines must be >= 0";
+                        } else {
+                            group_context_auto_compress_lines = static_cast<int>(num);
+                            reply = "set group_context_auto_compress_lines to " + std::to_string(num);
+                            do_save = true;
+                        }
+                    } else if (type == "gmax") {
+                        if (num < 1) {
+                            reply = "group_context_max_recent_lines must be >= 1";
+                        } else {
+                            group_context_max_recent_lines = static_cast<int>(num);
+                            reply = "set group_context_max_recent_lines to " + std::to_string(num);
+                            if (!group_context_use_summary) {
+                                Json::Value ign;
+                                Json::ArrayIndex max_recent =
+                                    static_cast<Json::ArrayIndex>(group_context_max_recent_lines);
+                                while (group_recent[id].size() > max_recent) {
+                                    group_recent[id].removeIndex(0, &ign);
+                                }
+                                do_save_history = true;
+                            }
                             do_save = true;
                         }
                     } else {
@@ -1317,6 +1417,7 @@ void gpt3_5::process(std::string message, const msg_meta &conf)
             }
             conf.p->cq_send(reply, conf);
             if (do_save) save_file();
+            if (do_save_history) save_history(id);
             return true;
         }},
         {".status",
@@ -1328,6 +1429,12 @@ void gpt3_5::process(std::string message, const msg_meta &conf)
                                             static_cast<int64_t>(RED_LINE);
                 int64_t trim_threshold = static_cast<int64_t>(MAX_TOKEN) -
                                         static_cast<int64_t>(MAX_REPLY);
+                int64_t group_recent_lines = static_cast<int64_t>(group_recent[id].size());
+                int64_t group_auto_threshold = static_cast<int64_t>(group_context_keep_lines) +
+                                               static_cast<int64_t>(group_context_auto_compress_lines);
+                int64_t group_auto_remaining = group_recent_lines > group_auto_threshold
+                                                   ? 0
+                                                   : group_auto_threshold + 1 - group_recent_lines;
                 reply = "current ai status:\n";
                 reply += "model: " + model_name + "\n";
                 reply += "mode: " + pre_default[id] + "\n";
@@ -1355,8 +1462,10 @@ void gpt3_5::process(std::string message, const msg_meta &conf)
                          std::to_string(reply_on_keyword) + "\n";
                 reply += "group compress model: " +
                          (group_compress_model.empty() ? model_name : group_compress_model) + "\n";
+                reply += "group_context_use_summary: " +
+                         std::to_string(group_context_use_summary) + "\n";
                 reply += "group recent lines: " +
-                         std::to_string(group_recent[id].size()) + "\n";
+                         std::to_string(group_recent_lines) + "\n";
                 reply += "group summary estimated tokens: " +
                          std::to_string(estimate_text_tokens(group_summary[id])) + "\n";
                 reply += "group context estimated tokens: " +
@@ -1365,7 +1474,17 @@ void gpt3_5::process(std::string message, const msg_meta &conf)
                          std::to_string(group_context_keep_lines) + "\n";
                 reply += "group_context_include_lines: " +
                          std::to_string(group_context_include_lines) + "\n";
-                reply += "note: passive group context is compressed only before active replies or manual .gcompress; request order is prompt -> active history -> group summary -> recent group -> current user";
+                reply += "group_context_auto_compress_lines: " +
+                         std::to_string(group_context_auto_compress_lines) + "\n";
+                reply += "group_context_auto_compress_threshold: " +
+                         std::to_string(group_auto_threshold) + "\n";
+                reply += "group_context_auto_compress_remaining_lines: " +
+                         (group_context_use_summary ?
+                              std::to_string(group_auto_remaining) :
+                              std::string("disabled")) + "\n";
+                reply += "group_context_max_recent_lines: " +
+                         std::to_string(group_context_max_recent_lines) + "\n";
+                reply += "note: request order is prompt -> group summary -> active history -> recent group -> current user; auto group compression runs only when summary is enabled and recent lines exceed keep+auto threshold";
             }
             conf.p->cq_send(reply, conf);
             return true;
@@ -1399,9 +1518,9 @@ void gpt3_5::process(std::string message, const msg_meta &conf)
 
     J["model"] = model_name;
 
-    if (is_group && record_group_messages) {
+    if (is_group && record_group_messages && group_context_use_summary) {
         std::string compress_error;
-        bool compressed = compress_group_context_with_key(id, keyid, conf,
+        bool compressed = compress_group_context_with_key(id, keyid, conf, false,
                                                           &compress_error);
         if (compressed) {
             save_history(id);
@@ -1413,6 +1532,7 @@ void gpt3_5::process(std::string message, const msg_meta &conf)
         }
         else if (!compress_error.empty() &&
                  compress_error != "group context already within keep lines." &&
+                 compress_error != "group context below auto compress threshold." &&
                  is_debug) {
             conf.p->setlog(LOG::INFO,
                            "openai: group context compress before reply skipped: " +
@@ -1450,12 +1570,15 @@ void gpt3_5::process(std::string message, const msg_meta &conf)
         }
 
         Json::Value K = mode_prompt[pre_default[id]];
+        if (is_group && record_group_messages) {
+            append_group_summary_context(id, K);
+        }
         Json::ArrayIndex sz = h.size();
         for (Json::ArrayIndex i = 0; i < sz; i++) {
             K.append(h[i]);
         }
         if (is_group && record_group_messages) {
-            append_group_context(id, K);
+            append_group_recent_context(id, K);
         }
         K.append(user_input_J);
         J["messages"] = K;
@@ -1629,8 +1752,9 @@ std::string gpt3_5::help()
            ".ai.arc restore [编号/文件名] - 从归档中恢复上下文\n"
            ".ai.sw - 仅 OP 可用, 关闭模型作维护用\n"
            ".ai.record 0|1 - 切换是否旁听并保存普通群消息\n"
+           ".ai.summary 0|1 - 切换是否把群聊摘要带入模型请求\n"
            ".ai.awake at/keyword 0|1 - 切换 @bot/设置的 wake 关键词是否触发回复\n"
-           ".ai.set reply/token/red/compress/gkeep/ginclude [数值] - 修改回复、主上下文和群聊旁听保留/带入条数\n"
+           ".ai.set reply/token/red/compress/gkeep/ginclude/gauto/gmax [数值] - 修改回复、主上下文和群聊旁听阈值\n"
            "权限说明：归档与恢复功能在群聊中需 OP权限，私聊可直接使用。";
 }
 
