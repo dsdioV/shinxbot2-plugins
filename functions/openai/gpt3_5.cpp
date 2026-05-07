@@ -587,29 +587,6 @@ static void strip_leading_reply_segment(std::string &message, int64_t &reply_id)
     }
 }
 
-static bool message_replies_to_bot(const msg_meta &conf, int64_t reply_id)
-{
-    if (reply_id == -1 || conf.p == nullptr) return false;
-
-    try {
-        Json::Value get_msg_param;
-        get_msg_param["message_id"] = reply_id;
-        Json::Value msg_info =
-            string_to_json(conf.p->cq_send("get_msg", get_msg_param));
-        if (msg_info["retcode"].asInt() != 0 ||
-            !msg_info.isMember("data") ||
-            !msg_info["data"].isMember("sender") ||
-            !msg_info["data"]["sender"].isMember("user_id")) {
-            return false;
-        }
-        return msg_info["data"]["sender"]["user_id"].asUInt64() ==
-               conf.p->get_botqq();
-    }
-    catch (...) {
-        return false;
-    }
-}
-
 static void send_forward_text(const std::string &content, const msg_meta &conf,
                               const std::string &node_name)
 {
@@ -842,7 +819,6 @@ void gpt3_5::process(std::string message, const msg_meta &conf)
 
     std::string nickname = get_cached_nickname(conf);
     bool is_group = conf.message_type == "group";
-    bool reply_to_bot = is_group && message_replies_to_bot(conf, reply_id);
     bool at_mentioned = is_group && message_mentions_bot(message, conf);
     bool keyword_mentioned = is_group && message_has_wake_keyword(message);
 
@@ -853,8 +829,7 @@ void gpt3_5::process(std::string message, const msg_meta &conf)
 
     bool explicit_ai = starts_with(working_message, ".ai");
     bool should_reply = explicit_ai || (reply_on_at && at_mentioned) ||
-                        reply_to_bot || (reply_on_keyword && keyword_mentioned) ||
-                        !is_group;
+                        (reply_on_keyword && keyword_mentioned) || !is_group;
 
     if (!should_reply) {
         return;
@@ -869,9 +844,6 @@ void gpt3_5::process(std::string message, const msg_meta &conf)
     message = do_black(message);
     if (!explicit_ai && at_mentioned && trim(message).empty()) {
         message = "（对方只 @ 了你，没有输入文字。请根据当前对话简短回应。）";
-    }
-    else if (!explicit_ai && reply_to_bot && trim(message).empty()) {
-        message = "（对方回复了你的消息，但没有输入文字。请根据被回复内容简短回应。）";
     }
 
     std::istringstream iss(message);
@@ -1345,8 +1317,7 @@ bool gpt3_5::check(std::string message, const msg_meta &conf)
         return true;
     }
     if (conf.message_type == "group" &&
-        ((reply_id != -1 && message_replies_to_bot(conf, reply_id)) ||
-         (reply_on_at && message_mentions_bot(message, conf)) ||
+        ((reply_on_at && message_mentions_bot(message, conf)) ||
          (reply_on_keyword && message_has_wake_keyword(message)))) {
         return true;
     }
@@ -1355,7 +1326,7 @@ bool gpt3_5::check(std::string message, const msg_meta &conf)
 
 std::string gpt3_5::help()
 {
-    return "OpenAI GPT-3.5：使用 .ai [内容]、@bot 或回复 bot 消息开始对话\n"
+    return "OpenAI GPT-3.5：使用 .ai [内容] 或 @bot 开始对话\n"
            "指令列表：\n"
            ".ai.reset - 重置当前对话上下文\n"
            ".ai.status - 以合并转发查看当前实际生效的模型/阈值/历史长度估算\n"
