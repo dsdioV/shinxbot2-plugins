@@ -4,7 +4,7 @@
 #include <algorithm>
 #include <cctype>
 #include <filesystem>
-#include <fstream>
+#include <mutex>
 #include <sstream>
 
 namespace fs = std::filesystem;
@@ -18,12 +18,11 @@ wordle::wordle() { load_banks(); }
 bool wordle::reload(const msg_meta &conf)
 {
     (void)conf;
+    std::lock_guard<std::mutex> bank_lock(bank_mtx_);
     banks_.clear();
     valid_words_.clear();
     difficulty_names_.clear();
-    group_games_.clear();
-    private_games_.clear();
-    load_banks();
+    load_banks();   // bank_mtx_ still held — safe
     return true;
 }
 
@@ -100,7 +99,7 @@ void wordle::process(std::string message, const msg_meta &conf)
 }
 
 /* ═══════════════════════════════════════════════════════════
-   Bank loading
+   Bank loading  (caller MUST hold bank_mtx_ or be ctor)
    ═══════════════════════════════════════════════════════════ */
 
 std::string wordle::clean_word(const std::string &raw)
@@ -134,11 +133,9 @@ std::vector<word_entry> wordle::parse_csv(const std::string &content)
         if (w.empty()) return;
 
         std::string def = trim(record.substr(comma + 1));
-        // Strip surrounding quotes if present
         if (def.size() >= 2 && def.front() == '"' && def.back() == '"') {
             def = def.substr(1, def.size() - 2);
         }
-        // Flatten newlines → spaces, collapse whitespace
         std::string clean_def;
         bool prev_space = false;
         for (char c : def) {
@@ -153,18 +150,15 @@ std::vector<word_entry> wordle::parse_csv(const std::string &content)
             }
         }
         def = trim(clean_def);
-
         result.push_back({w, def});
     };
 
     while (std::getline(iss, line)) {
-        // Normalise line ending
         if (!line.empty() && line.back() == '\r')
             line.pop_back();
 
         if (in_quotes) {
             accumulated += "\n" + line;
-            // Close when line ends with a single "
             char last = line.back();
             if (last == '"') {
                 in_quotes = false;
@@ -174,9 +168,8 @@ std::vector<word_entry> wordle::parse_csv(const std::string &content)
         }
         else {
             size_t comma = line.find(',');
-            if (comma == std::string::npos) continue; // skip malformed
+            if (comma == std::string::npos) continue;
 
-            // Check for multi-line quoted definition
             std::string rest = line.substr(comma + 1);
             size_t first = rest.find_first_not_of(" \t");
             bool opens_quote =
@@ -192,7 +185,6 @@ std::vector<word_entry> wordle::parse_csv(const std::string &content)
         }
     }
 
-    // Drain any leftover
     if (in_quotes && !accumulated.empty()) {
         process_record(accumulated);
     }
@@ -203,20 +195,15 @@ std::vector<word_entry> wordle::parse_csv(const std::string &content)
 void wordle::load_banks()
 {
     std::string dir_path = bot_config_path(nullptr, "features/wordle");
+    if (!fs::exists(dir_path)) return;
 
-    if (!fs::exists(dir_path)) {
-        return;
-    }
-
-    // 1. Scan *.csv files
     for (const auto &entry : fs::directory_iterator(dir_path)) {
         if (!entry.is_regular_file()) continue;
         auto ext = entry.path().extension().string();
         if (ext != ".csv") continue;
 
         std::string name = entry.path().stem().string();
-        std::string content =
-            readfile(entry.path().string(), "");
+        std::string content = readfile(entry.path().string(), "");
         if (content.empty()) continue;
 
         auto entries = parse_csv(content);
@@ -225,15 +212,12 @@ void wordle::load_banks()
         banks_[name] = std::move(entries);
         difficulty_names_.push_back(name);
 
-        // Feed all CSV words into validation set
-        for (const auto &e : banks_[name]) {
+        for (const auto &e : banks_[name])
             valid_words_.insert(e.word);
-        }
     }
 
     std::sort(difficulty_names_.begin(), difficulty_names_.end());
 
-    // 2. Load words.txt as extra validation vocabulary
     std::string words_path =
         bot_config_path(nullptr, "features/wordle/words.txt");
     std::string words_content = readfile(words_path, "");
@@ -249,13 +233,10 @@ void wordle::load_banks()
         }
     }
 
-    // If difficulty_names_ is empty but we have a lone words.txt,
-    // create a synthetic "words" bank so the plugin is usable OOTB.
     if (banks_.empty() && !valid_words_.empty()) {
         std::vector<word_entry> synth;
-        for (const auto &w : valid_words_) {
+        for (const auto &w : valid_words_)
             synth.push_back({w, ""});
-        }
         banks_["words"] = std::move(synth);
         difficulty_names_.push_back("words");
     }
@@ -267,10 +248,21 @@ void wordle::load_banks()
 
 wordle_game &wordle::get_game(const msg_meta &conf)
 {
+    // Caller MUST hold map_mtx_
     if (conf.message_type == "group") {
         return group_games_[conf.group_id];
     }
     return private_games_[conf.user_id];
+}
+
+locked_game wordle::acquire_game(const msg_meta &conf)
+{
+    // Lock ordering: map_mtx_ → game.mtx  (never the reverse)
+    std::unique_lock<std::mutex> map_lock(map_mtx_);
+    wordle_game &g = get_game(conf);
+    locked_game lg(g);          // locks g.mtx
+    map_lock.unlock();          // release map lock, keep game lock
+    return lg;
 }
 
 std::string wordle::check_guess(const std::string &guess,
@@ -280,7 +272,6 @@ std::string wordle::check_guess(const std::string &guess,
     std::string result(n, 'B');
     std::vector<int> remaining(26, 0);
 
-    // Pass 1: greens
     for (int i = 0; i < n; i++) {
         if (guess[i] == answer[i]) {
             result[i] = 'G';
@@ -290,7 +281,6 @@ std::string wordle::check_guess(const std::string &guess,
         }
     }
 
-    // Pass 2: yellows
     for (int i = 0; i < n; i++) {
         if (result[i] == 'G') continue;
         int idx = guess[i] - 'a';
@@ -338,7 +328,8 @@ std::string wordle::render_history(const wordle_game &game) const
 
 void wordle::cmd_start(const msg_meta &conf)
 {
-    auto &game = get_game(conf);
+    auto lg = acquire_game(conf);
+    auto &game = lg.game;
 
     if (game.active) {
         conf.p->cq_send(
@@ -348,41 +339,44 @@ void wordle::cmd_start(const msg_meta &conf)
         return;
     }
 
-    // Resolve difficulty — use persistent setting or first available
-    if (game.difficulty.empty() ||
-        banks_.find(game.difficulty) == banks_.end()) {
-        game.difficulty =
-            difficulty_names_.empty() ? "" : difficulty_names_.front();
-    }
-    auto bank_it = banks_.find(game.difficulty);
-    if (bank_it == banks_.end() || bank_it->second.empty()) {
-        conf.p->cq_send(
-            "没有可用词库。请将 CSV 词表放入 config/features/wordle/ 目录。",
-            conf);
-        return;
-    }
+    // ── Bank access (under bank_mtx_) ─────────────────────
+    const word_entry *chosen = nullptr;
+    {
+        std::lock_guard<std::mutex> bank_lock(bank_mtx_);
 
-    // Filter by word length
-    std::vector<const word_entry *> pool;
-    for (const auto &e : bank_it->second) {
-        if ((int)e.word.size() == game.word_length) {
-            pool.push_back(&e);
+        if (game.difficulty.empty() ||
+            banks_.find(game.difficulty) == banks_.end()) {
+            game.difficulty =
+                difficulty_names_.empty() ? "" : difficulty_names_.front();
         }
-    }
+        auto bank_it = banks_.find(game.difficulty);
+        if (bank_it == banks_.end() || bank_it->second.empty()) {
+            conf.p->cq_send(
+                "没有可用词库。请将 CSV 词表放入 "
+                "config/features/wordle/ 目录。",
+                conf);
+            return;
+        }
 
-    if (pool.empty()) {
-        conf.p->cq_send(
-            fmt::format("难度 '{}' 下没有长度为 {} 的单词。"
-                        "请用 *wordle set wordlength <3~8> 调整。",
-                        game.difficulty, game.word_length),
-            conf);
-        return;
-    }
+        std::vector<const word_entry *> pool;
+        for (const auto &e : bank_it->second) {
+            if ((int)e.word.size() == game.word_length)
+                pool.push_back(&e);
+        }
 
-    // Pick
-    const word_entry *chosen = pool[get_random((int)pool.size())];
+        if (pool.empty()) {
+            conf.p->cq_send(
+                fmt::format("难度 '{}' 下没有长度为 {} 的单词。"
+                            "请用 *wordle set wordlength <3~8> 调整。",
+                            game.difficulty, game.word_length),
+                conf);
+            return;
+        }
 
-    // Init game
+        chosen = pool[get_random((int)pool.size())];
+    }   // release bank_mtx_
+
+    // ── Init game ─────────────────────────────────────────
     game.active = true;
     game.answer = chosen->word;
     game.definition = chosen->definition;
@@ -392,9 +386,6 @@ void wordle::cmd_start(const msg_meta &conf)
     game.hinted_positions.clear();
     game.hint_blocked = false;
     game.last_guess_time = std::chrono::steady_clock::time_point{};
-
-    // Hides real length behind a placeholder so players don't deduce the word
-    // from help text, but honestly in a chat game they can just count
 
     conf.p->cq_send(
         fmt::format("Wordle 开始！\n"
@@ -407,7 +398,8 @@ void wordle::cmd_start(const msg_meta &conf)
 
 void wordle::cmd_guess(const msg_meta &conf, std::string guess)
 {
-    auto &game = get_game(conf);
+    auto lg = acquire_game(conf);
+    auto &game = lg.game;
 
     if (!game.active) {
         conf.p->cq_send("当前无进行中的对局。发送 *wordle start 开始。",
@@ -432,14 +424,17 @@ void wordle::cmd_guess(const msg_meta &conf, std::string guess)
         return;
     }
 
-    // Existence check
-    if (valid_words_.find(lower) == valid_words_.end()) {
-        conf.p->cq_send(
-            fmt::format("'{}' 不在词库里，换一个试试～", lower), conf);
-        return;
+    // Existence check (under bank_mtx_)
+    {
+        std::lock_guard<std::mutex> bank_lock(bank_mtx_);
+        if (valid_words_.find(lower) == valid_words_.end()) {
+            conf.p->cq_send(
+                fmt::format("'{}' 不在词库里，换一个试试～", lower), conf);
+            return;
+        }
     }
 
-    // Cooldown (4s) — prevent two users guessing simultaneously
+    // Cooldown (4s)
     {
         auto now = std::chrono::steady_clock::now();
         auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
@@ -473,7 +468,7 @@ void wordle::cmd_guess(const msg_meta &conf, std::string guess)
     // Duplicate guard
     for (const auto &h : game.history) {
         if (h.first == lower) {
-            conf.p->cq_send("很不幸, '" + lower + "' 已经猜过了，换一个试试。", conf);
+            conf.p->cq_send("'" + lower + "' 已经猜过了，换一个试试。", conf);
             return;
         }
     }
@@ -515,7 +510,8 @@ void wordle::cmd_guess(const msg_meta &conf, std::string guess)
 
 void wordle::cmd_status(const msg_meta &conf)
 {
-    auto &game = get_game(conf);
+    auto lg = acquire_game(conf);
+    auto &game = lg.game;
 
     if (!game.active) {
         conf.p->cq_send("当前无进行中的对局。", conf);
@@ -542,7 +538,8 @@ void wordle::cmd_status(const msg_meta &conf)
 
 void wordle::cmd_hint(const msg_meta &conf)
 {
-    auto &game = get_game(conf);
+    auto lg = acquire_game(conf);
+    auto &game = lg.game;
 
     if (!game.active) {
         conf.p->cq_send("当前无进行中的对局。", conf);
@@ -605,14 +602,14 @@ void wordle::cmd_hint(const msg_meta &conf)
 
 void wordle::cmd_abort(const msg_meta &conf)
 {
-    auto &game = get_game(conf);
+    auto lg = acquire_game(conf);
+    auto &game = lg.game;
 
     if (!game.active) {
         conf.p->cq_send("当前无进行中的对局。", conf);
         return;
     }
 
-    // Permissions: starter, bot admin, or group admin
     bool can_abort = conf.p->is_op(conf.user_id) ||
                      conf.user_id == game.starter;
     if (!can_abort && conf.message_type == "group") {
@@ -637,7 +634,8 @@ void wordle::cmd_abort(const msg_meta &conf)
 void wordle::cmd_set(const msg_meta &conf, std::string param,
                      std::string value)
 {
-    auto &game = get_game(conf);
+    auto lg = acquire_game(conf);
+    auto &game = lg.game;
 
     if (game.active) {
         conf.p->cq_send("当前对局进行中，无法修改设置。请等待对局结束后再试。",
@@ -645,7 +643,6 @@ void wordle::cmd_set(const msg_meta &conf, std::string param,
         return;
     }
 
-    // Normalise
     for (char &c : param)
         c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
     for (char &c : value)
@@ -661,7 +658,7 @@ void wordle::cmd_set(const msg_meta &conf, std::string param,
 
     /* ── difficulty ──────────────────────────────────── */
     if (param == "difficulty") {
-        // Case-insensitive match
+        std::lock_guard<std::mutex> bank_lock(bank_mtx_);
         for (const auto &name : difficulty_names_) {
             std::string lower_name = name;
             for (char &c : lower_name)
@@ -673,7 +670,6 @@ void wordle::cmd_set(const msg_meta &conf, std::string param,
                 return;
             }
         }
-        // Not found — list available
         std::ostringstream oss;
         oss << "未知难度: " << value << "\n当前可选: ";
         for (size_t i = 0; i < difficulty_names_.size(); i++) {
@@ -734,20 +730,24 @@ void wordle::cmd_help(const msg_meta &conf)
         << "  attempts    <1~20>     设置可猜次数\n\n"
         << "当前可选难度: ";
 
-    if (difficulty_names_.empty()) {
-        oss << "（无可用词库，请在 config/features/wordle/ 下放置 CSV 词表）";
-    }
-    else {
-        for (size_t i = 0; i < difficulty_names_.size(); i++) {
-            if (i) oss << ", ";
-            oss << difficulty_names_[i];
+    auto lg = acquire_game(conf);
+    auto &game = lg.game;
+
+    {
+        std::lock_guard<std::mutex> bank_lock(bank_mtx_);
+        if (difficulty_names_.empty()) {
+            oss << "（无可用词库，请在 config/features/wordle/ 下放置 CSV 词表）";
+        }
+        else {
+            for (size_t i = 0; i < difficulty_names_.size(); i++) {
+                if (i) oss << ", ";
+                oss << difficulty_names_[i];
+            }
         }
     }
-
-    auto &game_cfg = get_game(conf);
-    oss << "\n\n当前设置: 难度=" << game_cfg.difficulty
-        << " | 长度=" << game_cfg.word_length
-        << " | 次数=" << game_cfg.max_attempts;
+    oss << "\n\n当前设置: 难度=" << game.difficulty
+        << " | 长度=" << game.word_length
+        << " | 次数=" << game.max_attempts;
 
     conf.p->cq_send(oss.str(), conf);
 }

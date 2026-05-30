@@ -3,6 +3,7 @@
 #include "processable.h"
 #include <chrono>
 #include <map>
+#include <mutex>
 #include <set>
 #include <string>
 #include <unordered_map>
@@ -37,6 +38,20 @@ struct wordle_game {
 
     // must guess at least once before next hint
     bool hint_blocked = false;
+
+    // per-game mutex — serialises all mutations on this game
+    mutable std::mutex mtx;
+};
+
+/* ── RAII helper: holds game mutex for the caller's scope ─ */
+
+struct locked_game {
+    wordle_game &game;
+    std::unique_lock<std::mutex> lock;
+
+    explicit locked_game(wordle_game &g) : game(g), lock(g.mtx) {}
+    locked_game(locked_game &&) = default;
+    locked_game &operator=(locked_game &&) = default;
 };
 
 /* ── Plugin class ────────────────────────────────────────── */
@@ -52,22 +67,26 @@ public:
     bool reload(const msg_meta &conf) override;
 
 private:
-    /* Word banks */
-    // difficulty → word list (parsed from CSV files)
+    /* Word banks — protected by bank_mtx_ */
     std::unordered_map<std::string, std::vector<word_entry>> banks_;
-    // all valid guess words (from all CSVs + words.txt)
     std::unordered_set<std::string> valid_words_;
-    // available difficulty names (sorted)
     std::vector<std::string> difficulty_names_;
 
-    /* Per-group / per-private games */
+    /* Per-group / per-private games — map access protected by map_mtx_,
+       per-entry mutations protected by wordle_game::mtx              */
     std::map<groupid_t, wordle_game> group_games_;
     std::map<userid_t, wordle_game> private_games_;
 
+    mutable std::mutex map_mtx_;   // serialises group_games_ / private_games_ access
+    mutable std::mutex bank_mtx_;  // serialises banks_ / valid_words_ / difficulty_names_
+
     /* Internal helpers */
-    void load_banks();
+    void load_banks();   // caller MUST hold bank_mtx_ or be single-threaded (ctor)
     std::vector<word_entry> parse_csv(const std::string &content);
-    wordle_game &get_game(const msg_meta &conf);
+
+    wordle_game &get_game(const msg_meta &conf);   // caller MUST hold map_mtx_
+    locked_game acquire_game(const msg_meta &conf); // acquires both map_mtx_ (brief) + game.mtx
+
     static std::string clean_word(const std::string &raw);
 
     std::string check_guess(const std::string &guess,
@@ -75,7 +94,7 @@ private:
     std::string render_history(const wordle_game &game) const;
     static std::string render_color_block(const std::string &color);
 
-    /* Command handlers */
+    /* Command handlers — each acquires its own game lock */
     void cmd_start(const msg_meta &conf);
     void cmd_guess(const msg_meta &conf, std::string guess);
     void cmd_status(const msg_meta &conf);
