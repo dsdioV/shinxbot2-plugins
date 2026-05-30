@@ -639,6 +639,12 @@ void wordle::cmd_set(const msg_meta &conf, std::string param,
 {
     auto &game = get_game(conf);
 
+    if (game.active) {
+        conf.p->cq_send("当前对局进行中，无法修改设置。请等待对局结束后再试。",
+                        conf);
+        return;
+    }
+
     // Normalise
     for (char &c : param)
         c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
