@@ -157,10 +157,11 @@ void informer::process(std::string message, const msg_meta &conf)
     const auto add_handler = [&](const std::string &args) {
         std::string inputtime, inputmsg;
         std::istringstream iss(args);
-        iss >> inputtime >> inputmsg;
+        iss >> inputtime;
+        inputmsg = trim(args.substr(inputtime.size()));
 
-        if (inputmsg.find("multimedia.nt.qq.com.cn") != inputmsg.npos) {
-            conf.p->cq_send("请用旧版qq发送图片", conf);
+        if (inputmsg.empty()) {
+            conf.p->cq_send("请输入提醒内容。格式: inform.add [wday-]hh[:mm] message", conf);
             return true;
         }
         // TODO: download image and change inputmsg to local image path
