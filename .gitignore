@@ -2,3 +2,4 @@ lib/functions
 lib/events
 *.out
 *test*
+/.vscode
