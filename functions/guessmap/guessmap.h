@@ -125,6 +125,7 @@ public:
     void process(std::string message, const msg_meta &conf) override;
     bool check(std::string message, const msg_meta &conf) override;
     bool reload(const msg_meta &conf) override;
+    void set_backup_files(archivist *p, const std::string &name) override;
     std::string help() override;
 };
 

@@ -627,4 +627,9 @@ std::string nonogram::help()
     return "nonogram 游戏：输入 *nonogram [1~3] 开始。帮助：*nonogram.help";
 }
 
+void nonogram::set_backup_files(archivist *p, const std::string &name)
+{
+    p->add_path(name, bot_resource_path(nullptr, "nonogram/answer/"), "resource/nonogram/answer/");
+}
+
 DECLARE_FACTORY_FUNCTIONS(nonogram)

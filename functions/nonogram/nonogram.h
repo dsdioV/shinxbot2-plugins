@@ -96,10 +96,11 @@ private:
 
 public:
     nonogram();
-    void process(std::string message, const msg_meta &conf);
-    bool check(std::string message, const msg_meta &conf);
+    void process(std::string message, const msg_meta &conf) override;
+    bool check(std::string message, const msg_meta &conf) override;
     bool reload(const msg_meta &conf) override;
-    std::string help();
+    void set_backup_files(archivist *p, const std::string &name) override;
+    std::string help() override;
 };
 
 DECLARE_FACTORY_FUNCTIONS_HEADER
