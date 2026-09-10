@@ -1,19 +1,220 @@
 #include "wordle.h"
 #include "utils.h"
 
+#include <Magick++.h>
+
 #include <algorithm>
+#include <array>
 #include <cctype>
+#include <cstdio>
 #include <filesystem>
+#include <map>
+#include <memory>
 #include <mutex>
 #include <sstream>
+#include <vector>
 
 namespace fs = std::filesystem;
+
+/* ═══════════════════════════════════════════════════════════
+   Board image rendering
+
+   The board is drawn from scratch instead of being typeset as text: emoji
+   tiles and letters have different advance widths depending on the client's
+   font, so a text board cannot be aligned reliably.
+
+   Glyphs are rendered individually, trimmed to their ink box and composited
+   onto the tile centre.  Centring via annotate() + CenterGravity() would be
+   less code, but it centres the full line box (ascent + descent); with
+   all-caps text the empty descent pushes the visible ink up by ~10% of the
+   tile height, which is plainly visible.
+   ═══════════════════════════════════════════════════════════ */
+
+namespace {
+
+constexpr int TILE = 40;             // tile edge, px
+constexpr int GAP = 10;              // gap between tiles, px
+constexpr int MARGIN = 20;           // outer margin, px
+constexpr double CAP_RATIO = 0.55;   // cap height / tile edge
+
+const char *kBoardBg = "#FFFFFF";
+const char *kEmptyEdge = "#C8C8C8";
+const char *kLetter = "#FFFFFF";
+const char *kGreen = "#538D4E";
+const char *kYellow = "#B59F3B";
+const char *kGray = "#787C7E";
+
+const char *tile_color(char result)
+{
+    switch (result) {
+    case 'G': return kGreen;
+    case 'Y': return kYellow;
+    default:  return kGray;
+    }
+}
+
+/* Render one glyph as a transparent image trimmed to its ink box.
+   Returns false when no usable font is available at all. */
+bool make_glyph(char ch, double pointsize, const std::string &font,
+                Magick::Image &out)
+{
+    try {
+        Magick::Image img;
+        img.backgroundColor(Magick::Color("none"));
+        img.fillColor(Magick::Color(kLetter));
+        if (!font.empty()) img.font(font);
+        img.fontPointsize(pointsize);
+        img.read(std::string("label:") + ch);
+        img.trim();
+        if (img.columns() == 0 || img.rows() == 0) return false;
+        out = img;
+        return true;
+    }
+    catch (Magick::Exception &) {
+        return false;
+    }
+}
+
+/* config/features/wordle/font.ttf if present, else whatever fc-match
+   resolves for "sans".  An empty result means "let ImageMagick decide". */
+std::string lookup_font()
+{
+    const std::string configured =
+        bot_config_path(nullptr, "features/wordle/font.ttf");
+    if (fs::exists(configured)) return configured;
+
+    std::array<char, 256> buffer;
+    std::string result;
+    std::unique_ptr<FILE, decltype(&pclose)> pipe(
+        popen("fc-match --format=%{file} sans", "r"), pclose);
+    if (pipe) {
+        while (fgets(buffer.data(), buffer.size(), pipe.get()) != nullptr) {
+            result += buffer.data();
+        }
+    }
+    while (!result.empty() &&
+           (result.back() == '\n' || result.back() == '\r' ||
+            result.back() == ' ')) {
+        result.pop_back();
+    }
+    return result;
+}
+
+/* Everything the renderer needs, copied out from under the game lock so the
+   drawing (and the network send) can happen after it is released. */
+struct board_state {
+    std::vector<history_entry> history;
+    int rows = 0;
+    int cols = 0;
+};
+
+bool draw_board(const board_state &state, const std::string &font,
+                const std::string &out_path)
+{
+    if (state.rows <= 0 || state.cols <= 0) return false;
+
+    try {
+        Magick::Image probe;
+        if (!make_glyph('H', 100.0, font, probe)) return false;
+        const double pointsize =
+            100.0 * CAP_RATIO * TILE / static_cast<double>(probe.rows());
+
+        std::map<char, Magick::Image> glyphs;
+        const auto glyph_of = [&](char ch) -> const Magick::Image * {
+            // Letters are stored lowercase but the board shows them uppercase.
+            const char key = static_cast<char>(
+                std::toupper(static_cast<unsigned char>(ch)));
+            auto it = glyphs.find(key);
+            if (it == glyphs.end()) {
+                Magick::Image img;
+                if (!make_glyph(key, pointsize, font, img)) return nullptr;
+                it = glyphs.emplace(key, img).first;
+            }
+            return &it->second;
+        };
+
+        const int width = MARGIN * 2 + state.cols * TILE + (state.cols - 1) * GAP;
+        const int height = MARGIN * 2 + state.rows * TILE + (state.rows - 1) * GAP;
+        Magick::Image board(Magick::Geometry(width, height),
+                            Magick::Color(kBoardBg));
+
+        for (int r = 0; r < state.rows; r++) {
+            const int y = MARGIN + r * (TILE + GAP);
+            const history_entry *entry =
+                (r < static_cast<int>(state.history.size()))
+                    ? &state.history[r]
+                    : nullptr;
+
+            for (int c = 0; c < state.cols; c++) {
+                const int x = MARGIN + c * (TILE + GAP);
+
+                const bool is_guess =
+                    entry && !entry->is_hint &&
+                    c < static_cast<int>(entry->word.size());
+                const bool is_hint_cell =
+                    entry && entry->is_hint && entry->position == c;
+
+                if (!is_guess && !is_hint_cell) {
+                    // unplayed cell, or an unrevealed cell of a hint row
+                    board.strokeColor(Magick::Color(kEmptyEdge));
+                    board.strokeWidth(2);
+                    board.fillColor(Magick::Color("none"));
+                    board.draw(Magick::DrawableRectangle(
+                        x + 1, y + 1, x + TILE - 2, y + TILE - 2));
+                    continue;
+                }
+
+                char letter = is_guess ? entry->word[c] : entry->letter;
+                const Magick::Image *glyph = glyph_of(letter);
+                if (!glyph) return false;
+
+                board.strokeColor(Magick::Color("none"));
+                board.fillColor(Magick::Color(
+                    is_guess ? tile_color(entry->colors[c]) : kGreen));
+                board.draw(Magick::DrawableRectangle(
+                    x, y, x + TILE - 1, y + TILE - 1));
+                board.composite(*glyph, x + (TILE - glyph->columns()) / 2,
+                                y + (TILE - glyph->rows()) / 2,
+                                Magick::OverCompositeOp);
+            }
+        }
+
+        board.write(out_path);
+        return true;
+    }
+    catch (Magick::Exception &) {
+        return false;
+    }
+}
+
+}   // namespace
+
+/* Draw the board to a temporary png.  Returns true and fills `path` on
+   success; the caller is responsible for deleting the file after sending. */
+static bool render_board_file(const board_state &state, const std::string &font,
+                              std::string &path)
+{
+    const std::string target =
+        bot_resource_path(nullptr, "wordle/" + generate_uuid() + ".png");
+    std::error_code ec;
+    fs::create_directories(fs::path(target).parent_path(), ec);
+    if (!draw_board(state, font, target)) {
+        fs::remove(target, ec);
+        return false;
+    }
+    path = target;
+    return true;
+}
 
 /* ═══════════════════════════════════════════════════════════
    Lifecycle
    ═══════════════════════════════════════════════════════════ */
 
-wordle::wordle() { load_banks(); }
+wordle::wordle()
+{
+    load_banks();
+    load_font();
+}
 
 bool wordle::reload(const msg_meta &conf)
 {
@@ -23,6 +224,7 @@ bool wordle::reload(const msg_meta &conf)
     valid_words_.clear();
     difficulty_names_.clear();
     load_banks();   // bank_mtx_ still held — safe
+    load_font();
     return true;
 }
 
@@ -242,6 +444,30 @@ void wordle::load_banks()
     }
 }
 
+void wordle::load_font()
+{
+    const std::string configured =
+        bot_config_path(nullptr, "features/wordle/font.ttf");
+    std::string chosen = lookup_font();
+
+    if (!chosen.empty()) {
+        // ImageMagick only emits a warning when it cannot read a font and
+        // quietly substitutes its own default, so probe it here: a font we
+        // were explicitly told to use must not fail silently.
+        Magick::Image probe;
+        if (!make_glyph('H', 40.0, chosen, probe)) {
+            if (fs::exists(configured)) {
+                set_global_log(LOG::WARNING, "wordle: 无法加载字体 " +
+                                                 configured +
+                                                 "，图片输出将退回文字棋盘");
+            }
+            chosen.clear();
+        }
+    }
+
+    font_path_ = chosen;
+}
+
 /* ═══════════════════════════════════════════════════════════
    Game helpers
    ═══════════════════════════════════════════════════════════ */
@@ -306,18 +532,40 @@ std::string wordle::render_color_block(const std::string &color)
     return oss.str();
 }
 
-std::string wordle::render_history(const wordle_game &game) const
+std::string wordle::render_history(const std::vector<history_entry> &history,
+                                   int cols) const
 {
-    if (game.history.empty()) return "";
+    if (history.empty()) return "";
 
     std::ostringstream oss;
-    for (const auto &h : game.history) {
-        oss << render_color_block(h.second) << "\n";
-        for (size_t i = 0; i < h.first.size(); i++) {
-            if (i) oss << " ";
-            oss << (char)std::toupper(static_cast<unsigned char>(h.first[i]));
+    for (const auto &h : history) {
+        if (h.is_hint) {
+            // A hint consumes a row of its own: green where the letter was
+            // revealed, empty everywhere else.
+            std::string colors(cols, 'B');
+            if (h.position >= 0 && h.position < cols) colors[h.position] = 'G';
+            oss << render_color_block(colors) << "\n";
+            for (int i = 0; i < cols; i++) {
+                if (i) oss << " ";
+                if (i == h.position) {
+                    oss << (char)std::toupper(
+                        static_cast<unsigned char>(h.letter));
+                }
+                else {
+                    oss << "-";
+                }
+            }
+            oss << "\n";
         }
-        oss << "\n";
+        else {
+            oss << render_color_block(h.colors) << "\n";
+            for (size_t i = 0; i < h.word.size(); i++) {
+                if (i) oss << " ";
+                oss << (char)std::toupper(
+                    static_cast<unsigned char>(h.word[i]));
+            }
+            oss << "\n";
+        }
     }
     return oss.str();
 }
@@ -425,6 +673,7 @@ void wordle::cmd_guess(const msg_meta &conf, std::string guess)
     }
 
     // Existence check (under bank_mtx_)
+    std::string font;
     {
         std::lock_guard<std::mutex> bank_lock(bank_mtx_);
         if (valid_words_.find(lower) == valid_words_.end()) {
@@ -432,6 +681,7 @@ void wordle::cmd_guess(const msg_meta &conf, std::string guess)
                 fmt::format("'{}' 不在词库里，换一个试试～", lower), conf);
             return;
         }
+        font = font_path_;
     }
 
     // Cooldown (4s)
@@ -467,73 +717,129 @@ void wordle::cmd_guess(const msg_meta &conf, std::string guess)
 
     // Duplicate guard
     for (const auto &h : game.history) {
-        if (h.first == lower) {
+        if (!h.is_hint && h.word == lower) {
             conf.p->cq_send("'" + lower + "' 已经猜过了，换一个试试。", conf);
             return;
         }
     }
 
     // Evaluate
-    std::string color = check_guess(lower, game.answer);
-    game.history.push_back({lower, color});
+    history_entry guess_entry;
+    guess_entry.word = lower;
+    guess_entry.colors = check_guess(lower, game.answer);
+    game.history.push_back(guess_entry);
     game.attempts_used++;
 
     bool win = true;
-    for (char c : color) {
+    for (char c : guess_entry.colors) {
         if (c != 'G') {
             win = false;
             break;
         }
     }
 
+    const bool finished = win || game.attempts_used >= game.max_attempts;
+    if (finished) game.active = false;
+
+    // Snapshot everything the renderer needs and drop the game lock before
+    // drawing: rendering and sending are slow and must not block other
+    // players in the same chat.
+    board_state state;
+    state.history = game.history;
+    state.rows = game.max_attempts;
+    state.cols = game.word_length;
+    const std::string answer = game.answer;
+    const std::string definition = game.definition;
+    const int used = game.attempts_used;
+
+    lg.lock.unlock();
+
+    std::string image_path;
+    std::string board;
+    if (render_board_file(state, font, image_path)) {
+        board = "[CQ:image,file=file://" +
+                fs::absolute(fs::path(image_path)).string() + ",id=40000]";
+    }
+    else {
+        board = render_history(state.history, state.cols);
+    }
+
     std::ostringstream oss;
-    oss << render_history(game);
-    oss << "—— " << game.attempts_used << "/" << game.max_attempts << " ——";
+    oss << board << "\n—— " << used << "/" << state.rows << " ——";
 
     if (win) {
         oss << "\n恭喜猜中！";
-        oss << "\n答案: " << game.answer;
-        if (!game.definition.empty())
-            oss << "\n释义: " << game.definition;
-        game.active = false;
+        oss << "\n答案: " << answer;
+        if (!definition.empty()) oss << "\n释义: " << definition;
     }
-    else if (game.attempts_used >= game.max_attempts) {
+    else if (used >= state.rows) {
         oss << "\n次数用尽！";
-        oss << "\n答案: " << game.answer;
-        if (!game.definition.empty())
-            oss << "\n释义: " << game.definition;
-        game.active = false;
+        oss << "\n答案: " << answer;
+        if (!definition.empty()) oss << "\n释义: " << definition;
     }
 
     conf.p->cq_send(oss.str(), conf);
+
+    if (!image_path.empty()) {
+        std::error_code ec;
+        fs::remove(image_path, ec);
+    }
 }
 
 void wordle::cmd_status(const msg_meta &conf)
 {
-    auto lg = acquire_game(conf);
-    auto &game = lg.game;
+    board_state state;
+    std::string header;
+    int used = 0;
+    std::string font;
+    {
+        auto lg = acquire_game(conf);
+        auto &game = lg.game;
 
-    if (!game.active) {
-        conf.p->cq_send("当前无进行中的对局。", conf);
-        return;
+        if (!game.active) {
+            conf.p->cq_send("当前无进行中的对局。", conf);
+            return;
+        }
+
+        std::ostringstream hdr;
+        hdr << "Wordle 对局状态\n"
+            << "难度: " << game.difficulty
+            << " | 单词长度: " << game.word_length
+            << " | 已用: " << game.attempts_used << "/" << game.max_attempts;
+        header = hdr.str();
+
+        state.history = game.history;
+        state.rows = game.max_attempts;
+        state.cols = game.word_length;
+        used = game.attempts_used;
+
+        std::lock_guard<std::mutex> bank_lock(bank_mtx_);
+        font = font_path_;
+    }   // game lock released before drawing
+
+    const std::string counter =
+        "—— " + std::to_string(used) + "/" + std::to_string(state.rows) + " ——";
+
+    std::string image_path;
+    std::string board;
+    if (state.history.empty()) {
+        board = "还没有人猜过。";
     }
-
-    std::ostringstream oss;
-    oss << "Wordle 对局状态\n"
-        << "难度: " << game.difficulty
-        << " | 单词长度: " << game.word_length
-        << " | 已用: " << game.attempts_used << "/" << game.max_attempts
-        << "\n";
-    if (game.history.empty()) {
-        oss << "还没有人猜过。";
+    else if (render_board_file(state, font, image_path)) {
+        board = "[CQ:image,file=file://" +
+                fs::absolute(fs::path(image_path)).string() + ",id=40000]\n" +
+                counter;
     }
     else {
-        oss << render_history(game);
-        oss << "—— " << game.attempts_used << "/" << game.max_attempts
-            << " ——";
+        board = render_history(state.history, state.cols) + counter;
     }
 
-    conf.p->cq_send(oss.str(), conf);
+    conf.p->cq_send(header + "\n" + board, conf);
+
+    if (!image_path.empty()) {
+        std::error_code ec;
+        fs::remove(image_path, ec);
+    }
 }
 
 void wordle::cmd_hint(const msg_meta &conf)
@@ -559,8 +865,9 @@ void wordle::cmd_hint(const msg_meta &conf)
     // Find first letter position not yet correctly guessed
     std::set<int> green_positions;
     for (const auto &h : game.history) {
-        for (size_t i = 0; i < h.second.size(); i++) {
-            if (h.second[i] == 'G') green_positions.insert((int)i);
+        if (h.is_hint) continue;
+        for (size_t i = 0; i < h.colors.size(); i++) {
+            if (h.colors[i] == 'G') green_positions.insert((int)i);
         }
     }
 
@@ -583,21 +890,62 @@ void wordle::cmd_hint(const msg_meta &conf)
     char revealed = game.answer[hint_pos];
     game.attempts_used++;
 
+    // A hint burns one attempt, so it takes a row of its own on the board.
+    history_entry hint_entry;
+    hint_entry.is_hint = true;
+    hint_entry.position = hint_pos;
+    hint_entry.letter = revealed;
+    game.history.push_back(hint_entry);
+
+    const bool exhausted = game.attempts_used >= game.max_attempts;
+    if (exhausted) game.active = false;
+
+    // Snapshot and draw outside the game lock, same as a guess: the reply
+    // shows the board so the extra row spent on the hint is visible instead
+    // of the attempt counter simply jumping.
+    board_state state;
+    state.history = game.history;
+    state.rows = game.max_attempts;
+    state.cols = game.word_length;
+    const std::string answer = game.answer;
+    const std::string definition = game.definition;
+    const int used = game.attempts_used;
+    std::string font;
+    {
+        std::lock_guard<std::mutex> bank_lock(bank_mtx_);
+        font = font_path_;
+    }
+
+    lg.lock.unlock();
+
+    std::string image_path;
+    std::string board;
+    if (render_board_file(state, font, image_path)) {
+        board = "[CQ:image,file=file://" +
+                fs::absolute(fs::path(image_path)).string() + ",id=40000]";
+    }
+    else {
+        board = render_history(state.history, state.cols);
+    }
+
     std::ostringstream oss;
     oss << "提示：第 " << (hint_pos + 1) << " 个字母是 '"
         << (char)std::toupper(static_cast<unsigned char>(revealed))
         << "'\n"
-        << "（消耗一次猜测机会）\n";
-    oss << "—— " << game.attempts_used << "/" << game.max_attempts << " ——";
+        << "（消耗一次猜测机会）\n"
+        << board << "\n—— " << used << "/" << state.rows << " ——";
 
-    if (game.attempts_used >= game.max_attempts) {
-        oss << "\n次数用尽！\n答案: " << game.answer;
-        if (!game.definition.empty())
-            oss << "\n释义: " << game.definition;
-        game.active = false;
+    if (exhausted) {
+        oss << "\n次数用尽！\n答案: " << answer;
+        if (!definition.empty()) oss << "\n释义: " << definition;
     }
 
     conf.p->cq_send(oss.str(), conf);
+
+    if (!image_path.empty()) {
+        std::error_code ec;
+        fs::remove(image_path, ec);
+    }
 }
 
 void wordle::cmd_abort(const msg_meta &conf)
@@ -728,6 +1076,8 @@ void wordle::cmd_help(const msg_meta &conf)
         << "  difficulty  <名称>     切换难度\n"
         << "  wordlength  <3~8>      设置单词长度\n"
         << "  attempts    <1~20>     设置可猜次数\n\n"
+        << "棋盘以图片发送；若未配置字体（config/features/wordle/font.ttf）\n"
+        << "则退回文字棋盘。\n\n"
         << "当前可选难度: ";
 
     auto lg = acquire_game(conf);

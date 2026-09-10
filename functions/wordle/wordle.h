@@ -17,6 +17,18 @@ struct word_entry {
     std::string definition; // cleaned (newlines → spaces, collapsed whitespace)
 };
 
+/* One entry on the timeline: either a guess, or a hint (a hint occupies a row
+   too, since it consumes one of the player's attempts). */
+struct history_entry {
+    bool is_hint = false;
+
+    std::string word;    // !is_hint: the guessed word (lowercase)
+    std::string colors;  // !is_hint: per-letter result, e.g. "GYBBG"
+
+    int position = -1;   // is_hint: revealed position
+    char letter = 0;     // is_hint: revealed letter (lowercase)
+};
+
 struct wordle_game {
     bool active = false;
     std::string answer;       // lowercase
@@ -27,8 +39,8 @@ struct wordle_game {
     userid_t starter = 0;
     std::string difficulty;   // e.g. "CET4"
 
-    // history: (guess, color-string like "GGYYB")
-    std::vector<std::pair<std::string, std::string>> history;
+    // history: guesses and hints in the order they happened
+    std::vector<history_entry> history;
 
     // cooldown — prevent double-guess from two users at once
     std::chrono::steady_clock::time_point last_guess_time;
@@ -72,6 +84,10 @@ private:
     std::unordered_set<std::string> valid_words_;
     std::vector<std::string> difficulty_names_;
 
+    /* Font used when drawing the board image — resolved by load_font(),
+       also protected by bank_mtx_ (same lifecycle as the banks). */
+    std::string font_path_;
+
     /* Per-group / per-private games — map access protected by map_mtx_,
        per-entry mutations protected by wordle_game::mtx              */
     std::map<groupid_t, wordle_game> group_games_;
@@ -82,6 +98,7 @@ private:
 
     /* Internal helpers */
     void load_banks();   // caller MUST hold bank_mtx_ or be single-threaded (ctor)
+    void load_font();    // caller MUST hold bank_mtx_ or be single-threaded (ctor)
     std::vector<word_entry> parse_csv(const std::string &content);
 
     wordle_game &get_game(const msg_meta &conf);   // caller MUST hold map_mtx_
@@ -91,7 +108,8 @@ private:
 
     std::string check_guess(const std::string &guess,
                             const std::string &answer) const;
-    std::string render_history(const wordle_game &game) const;
+    std::string render_history(const std::vector<history_entry> &history,
+                               int cols) const;
     static std::string render_color_block(const std::string &color);
 
     /* Command handlers — each acquires its own game lock */
