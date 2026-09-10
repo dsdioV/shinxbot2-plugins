@@ -2,7 +2,9 @@
 
 #include <string>
 #include <vector>
+#include <algorithm>
 #include <climits>
+#include <cfloat>
 #include <cmath>
 #include <fmt/core.h>
 
@@ -33,7 +35,7 @@ namespace dice_tokenizer {
     enum class TokenType {
         NUM, PLUS, MINUS, MUL, DIV, POW,
         D, MIN_FUNC, MAX_FUNC,
-        LPAREN, RPAREN, END
+        LPAREN, RPAREN, COMMA, END
     };
 
     struct Token {
@@ -47,7 +49,10 @@ namespace dice_tokenizer {
         D_UNARY,
         D_BINARY,
         MINFUNC,
-        MAXFUNC
+        MAXFUNC,
+        MINLISTFUNC,
+        MAXLISTFUNC,
+        LISTFUNCRENDERING
     };
 
     enum class DiceMode {
@@ -90,6 +95,9 @@ namespace dice_tokenizer {
             case OpType::D_UNARY:
             case OpType::D_BINARY:
                 return 5;
+            case OpType::MINLISTFUNC:
+            case OpType::MAXLISTFUNC:
+                return 5;
             default:
                 return 0;
         }
@@ -109,6 +117,9 @@ namespace dice_tokenizer {
             case OpType::D_BINARY: return "D_BINARY";
             case OpType::MINFUNC: return "MINFUNC";
             case OpType::MAXFUNC: return "MAXFUNC";
+            case OpType::MINLISTFUNC: return "MINLISTFUNC";
+            case OpType::MAXLISTFUNC: return "MAXLISTFUNC";
+            case OpType::LISTFUNCRENDERING: return "LISTFUNCRENDERING";
         }
         return "UNKNOWN";
     }
@@ -127,6 +138,9 @@ namespace dice_tokenizer {
             case OpType::D_BINARY: return "d";
             case OpType::MINFUNC: return "min";
             case OpType::MAXFUNC: return "max";
+            case OpType::MINLISTFUNC: return "min";
+            case OpType::MAXLISTFUNC: return "max";
+            case OpType::LISTFUNCRENDERING: return "";
         }
         return "UNKNOWN";
     }
@@ -139,14 +153,14 @@ namespace dice_tokenizer {
         ExpTree* left;
         ExpTree* right;
 
-        ExpTree(int v) : op(OpType::NUMBER), value(v), calcVal(0), left(nullptr), right(nullptr) {}
+        ExpTree(int v) : op(OpType::NUMBER), value(v), calcVal(v), left(nullptr), right(nullptr) {}
         ExpTree(OpType op, ExpTree* l = nullptr, ExpTree* r = nullptr)
             : op(op), value(0), calcVal(0), left(l), right(r) {}
 
         std::string output() {
             switch (op) {
                 case OpType::NUMBER:
-                    return myToString(value);
+                    return myToString(calcVal);
 
                 case OpType::D_UNARY:
                     return fmt::format("d{}", right->output());
@@ -159,6 +173,20 @@ namespace dice_tokenizer {
 
                 case OpType::MAXFUNC:
                     return fmt::format("max({})", right->output());
+
+                case OpType::MINLISTFUNC:
+                case OpType::MAXLISTFUNC: {
+                    std::vector<ExpTree*> args = collectFuncArgs();
+                    std::string joined;
+                    for (size_t i = 0; i < args.size(); ++i) {
+                        if (i) joined += ",";
+                        joined += args[i]->output();
+                    }
+                    return fmt::format("{}({})", opToString(op, value), joined);
+                }
+                
+                case OpType::LISTFUNCRENDERING:
+                    return fmt::format("{}", renderedStr);
 
                 default:
                     std::string leftStr = left ? left->output() : "";
@@ -173,6 +201,27 @@ namespace dice_tokenizer {
                     }
                     return fmt::format("{}{}{}", leftStr, opToString(op, value), rightStr);
             }
+        }
+
+        std::vector<ExpTree*> collectFuncArgs() {
+            std::vector<ExpTree*> args;
+            if (left) {
+                if (left->op == op) {
+                    auto leftArgs = left->collectFuncArgs();
+                    args.insert(args.end(), leftArgs.begin(), leftArgs.end());
+                } else {
+                    args.push_back(left);
+                }
+            }
+            if (right) {
+                if (right->op == op) {
+                    auto rightArgs = right->collectFuncArgs();
+                    args.insert(args.end(), rightArgs.begin(), rightArgs.end());
+                } else {
+                    args.push_back(right);
+                }
+            }
+            return args;
         }
 
         std::string outputPostfix() {
@@ -198,6 +247,19 @@ namespace dice_tokenizer {
             }
         }
 
+        void removeChildren() {
+            if (left) {
+                left->removeChildren();
+                delete left;
+                left = nullptr;
+            }
+            if (right) {
+                right->removeChildren();
+                delete right;
+                right = nullptr;
+            }
+        }
+
         /**
          * Recursively evaluate the expression tree where possible, reducing it to a simpler form. This does not perform dice rolls, only arithmetic simplification.
          * @return true if the node was reduced to a number
@@ -207,6 +269,43 @@ namespace dice_tokenizer {
             if (op == OpType::NUMBER) {
                 renderedStr = myToString(calcVal);
                 return true;
+            }
+
+            if (op == OpType::LISTFUNCRENDERING) {
+                op = OpType::NUMBER;
+                renderedStr = myToString(calcVal);
+                return true;
+            }
+
+            if (op == OpType::MINLISTFUNC || op == OpType::MAXLISTFUNC) {
+                std::vector<ExpTree*> args = collectFuncArgs();
+                bool allReduced = true;
+                for (auto arg : args) {
+                    if (!arg->reduce()) {
+                        allReduced = false;
+                    }
+                }
+                renderedStr = fmt::format("{}(", opToString(op, calcVal));
+                for (size_t i = 0; i < args.size(); ++i) {
+                    if (i) renderedStr += ",";
+                    renderedStr += args[i]->renderedStr;
+                }
+                renderedStr += ")";
+                if (allReduced) {
+                    double result = op == OpType::MINLISTFUNC ? DBL_MAX : -DBL_MAX;
+                    for (auto arg : args) {
+                        if (op == OpType::MINLISTFUNC) {
+                            result = std::min(result, arg->calcVal);
+                        } else {
+                            result = std::max(result, arg->calcVal);
+                        }
+                    }
+                    calcVal = result;
+                    op = OpType::LISTFUNCRENDERING;
+                    renderedStr += "=" + myToString(calcVal);
+                    removeChildren();
+                }
+                return false;
             }
 
             bool leftReduced = left ? left->reduce() : true;
@@ -259,6 +358,9 @@ namespace dice_tokenizer {
          * @return true if any dice were rolled
          */
         bool doDice(DiceMode mode = DiceMode::SUM) {
+            if (op == OpType::LISTFUNCRENDERING) {
+                return true;
+            }
             renderedStr = "";
             if (op == OpType::D_UNARY) {
                 if (right->op != OpType::NUMBER) {
@@ -302,6 +404,27 @@ namespace dice_tokenizer {
                 delete right;
                 right = nullptr;
                 return true;
+            }
+
+            if (op == OpType::MINLISTFUNC || op == OpType::MAXLISTFUNC) {
+                if (!left && !right) {
+                    return false;
+                }
+                
+                std::vector<ExpTree*> args = collectFuncArgs();
+                bool result = false;
+                for (auto arg : args) {
+                    if (arg->op != OpType::NUMBER) {
+                        result |= arg->doDice();
+                    }
+                }
+                renderedStr = fmt::format("{}(", op == OpType::MINLISTFUNC ? "min" : "max");
+                for (size_t i = 0; i < args.size(); ++i) {
+                    if (i) renderedStr += ",";
+                    renderedStr += args[i]->renderedStr;
+                }
+                renderedStr += ")";
+                return result;
             }
 
             if (op == OpType::D_BINARY) {
@@ -498,6 +621,7 @@ namespace dice_tokenizer {
                 case '^': return {TokenType::POW, 0};
                 case '(': return {TokenType::LPAREN, 0};
                 case ')': return {TokenType::RPAREN, 0};
+                case ',': return {TokenType::COMMA, 0};
             }
 
             throw std::runtime_error("Invalid character");
@@ -509,7 +633,8 @@ namespace dice_tokenizer {
         // mul_div     = power ((*|/) power)*
         // power       = d_level (^ d_level)*
         // d_level     = (+|-) d_level | (d d_level) | primary (d d_level)*
-        // primary     = number | '('expr')' | min(primary) | max(primary)
+        // primary     = number | '('expr')' | min'('expr_list')' | max'('expr_list')' | min'('expr')' | max'('expr')'
+        // expr_list   = add_sub (',' add_sub)*
         Lexer lexer;
         Token cur;
 
@@ -616,11 +741,22 @@ namespace dice_tokenizer {
                 }
                 next();
                 auto node = parseAddSub();
+                while (cur.type == TokenType::COMMA) {
+                    if (func == OpType::MINFUNC) func = OpType::MINLISTFUNC;
+                    else if (func == OpType::MAXFUNC) func = OpType::MAXLISTFUNC;
+                    next();
+                    auto nextArg = parseAddSub();
+                    node = new ExpTree(func, node, nextArg);
+                }
                 if (cur.type != TokenType::RPAREN) {
                     throw std::runtime_error("Missing )");
                 }
                 next();
-                return new ExpTree(func, nullptr, node);
+                if (func == OpType::MINFUNC || func == OpType::MAXFUNC) {
+                    return new ExpTree(func, nullptr, node);
+                } else {
+                    return node;
+                }
             }
 
             throw std::runtime_error("Invalid expression");

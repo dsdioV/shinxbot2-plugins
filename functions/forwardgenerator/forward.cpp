@@ -89,6 +89,7 @@ Json::Value forward_msg_gen::get_content(bot *p, std::wistringstream &wiss,
 
 void forward_msg_gen::process(std::string message, const msg_meta &conf)
 {
+    message = substitute_image_segment(conf.p, message);
     Json::Value J;
     J["message_id"] = conf.message_id;
     conf.p->cq_send("mark_msg_as_read", J);

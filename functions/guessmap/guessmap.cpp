@@ -1178,6 +1178,11 @@ void guessmap::process(std::string message, const msg_meta &conf)
     react_or_reply(conf, "10068", "?");
 }
 
+void guessmap::set_backup_files(archivist *p, const std::string &name)
+{
+    p->add_path(name, bot_resource_path(nullptr, "guessmap/images/"), "resource/guessmap/images/");
+}
+
 std::string guessmap::help()
 {
     return "蔚蓝猜地图：根据截图猜地图。帮助：*guess.help";
