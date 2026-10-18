@@ -266,6 +266,15 @@ gpt3_5::gpt3_5()
     if (search_max_rounds < 1) search_max_rounds = 1;
     if (search_max_rounds > 5) search_max_rounds = 5;
 
+    // 工具调用兜底端点。newapi 中转会丢 tool_calls，检测到畸形响应时
+    // 整轮改用这里重跑。默认复用搜索 key + DeepSeek 官方。
+    tool_fallback_base_url = res.get("tool_fallback_base_url", "").asString();
+    tool_fallback_model = res.get("tool_fallback_model", "").asString();
+    tool_fallback_key = res.get("tool_fallback_key", "").asString();
+    if (tool_fallback_base_url.empty()) tool_fallback_base_url = search_base_url;
+    if (tool_fallback_model.empty()) tool_fallback_model = "deepseek-chat";
+    if (tool_fallback_key.empty()) tool_fallback_key = search_api_key;
+
     is_open = true;
     is_debug = false;
     key_cycle = 0;
@@ -320,6 +329,9 @@ void gpt3_5::save_file()
     J["search_enabled"] = search_enabled;
     J["search_count"] = search_count;
     J["search_max_rounds"] = search_max_rounds;
+    J["tool_fallback_base_url"] = tool_fallback_base_url;
+    J["tool_fallback_model"] = tool_fallback_model;
+    J["tool_fallback_key"] = tool_fallback_key;
     for (const std::string &u : modes) {
         J[u] = mode_prompt[u];
     }
@@ -2208,6 +2220,25 @@ std::string gpt3_5::exec_tool_call(const Json::Value &call,
     return "未知工具：" + name;
 }
 
+/// 识别"声称调用了工具、却没给 tool_calls 内容"的畸形响应。
+/// 典型来源：把流式响应拼回非流式的转接层只累积了 delta.content，
+/// 却把 finish_reason 原样透传（实测 shinxbot-stream-adapter 就是这样）。
+bool gpt3_5::is_malformed_tool_response(const Json::Value &resp)
+{
+    if (!resp.isMember("choices") || !resp["choices"].isArray() ||
+        resp["choices"].empty()) {
+        return false;
+    }
+    const Json::Value &ch = resp["choices"][0];
+    if (ch.get("finish_reason", "").asString() != "tool_calls") return false;
+
+    const Json::Value &calls = ch["message"]["tool_calls"];
+    const bool has_calls = calls.isArray() && !calls.empty();
+    const bool has_text = !trim(ch["message"].get("content", "").asString()).empty();
+    // 有 finish_reason=tool_calls 却没有工具调用、也没有正文 → 内容丢了
+    return !has_calls && !has_text;
+}
+
 Json::Value gpt3_5::run_chat_with_tools(Json::Value request, size_t keyid,
                                        const msg_meta &conf)
 {
@@ -2217,14 +2248,23 @@ Json::Value gpt3_5::run_chat_with_tools(Json::Value request, size_t keyid,
         request["tool_choice"] = "auto";
     }
 
+    // 一旦发现中转丢了 tool_calls，整轮改走兜底端点重跑。
+    // 之所以是"整轮"而不是"这一次请求"：工具循环必须是同一模型的连续
+    // 对话，中途换模型会让 tool_call_id 对不上。
+    std::string cur_base = base_url;
+    std::string cur_model = model_name;
+    std::string cur_key = key[keyid];
+    bool using_fallback = false;
+
     Json::Value resp;
     int rounds = 0;
     while (true) {
         try {
+            request["model"] = cur_model;
             resp = string_to_json(do_post(
-                base_url, "/v1/chat/completions", false, request,
+                cur_base, "/v1/chat/completions", false, request,
                 {{"Content-Type", "application/json"},
-                 {"Authorization", "Bearer " + key[keyid]}},
+                 {"Authorization", "Bearer " + cur_key}},
                 true));
         }
         catch (const std::string &e) {
@@ -2236,6 +2276,24 @@ Json::Value gpt3_5::run_chat_with_tools(Json::Value request, size_t keyid,
             Json::Value err;
             err["error"]["message"] = "http connection failed.";
             return err;
+        }
+
+        // 中转丢了 tool_calls：切到兜底端点，本轮从头重来
+        if (!using_fallback && is_malformed_tool_response(resp) &&
+            !trim(tool_fallback_base_url).empty() &&
+            !trim(tool_fallback_key).empty() &&
+            !trim(tool_fallback_model).empty()) {
+            using_fallback = true;
+            tool_fallback_count++;
+            conf.p->setlog(
+                LOG::WARNING,
+                "openai: 中转未返回 tool_calls，本轮改用兜底端点 "
+                + tool_fallback_base_url + " model=" + tool_fallback_model);
+            cur_base = tool_fallback_base_url;
+            cur_model = tool_fallback_model;
+            cur_key = tool_fallback_key;
+            rounds = 0;
+            continue;
         }
 
         if (resp.isMember("error")) return resp;

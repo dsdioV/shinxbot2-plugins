@@ -61,15 +61,27 @@ private:
     // ── 工具调用（web search）──────────────────────────────────────
     // 走 OpenAI 原生 tools / tool_calls，不是"猜关键词再搜"的固定流程。
     // 这也是以后接 MCP 的同一套地基：加工具 = 往 tools 里多塞一个定义。
+    //
+    // 为什么需要 fallback：newapi 中转在把上游（gemini 等）响应转成
+    // OpenAI 格式时会丢掉 tool_calls 数组，只留下 finish_reason="tool_calls"。
+    // 实测 12 种请求变体（含 tool_choice=none）全都如此，是服务端缺陷。
+    // 对策：一旦检测到这种畸形响应，就把本轮整体改用 tool_fallback_*
+    // 指向的端点重跑（默认 DeepSeek 官方，它的 tool_calls 是标准的）。
     std::string search_api_key;
     std::string search_base_url = "https://api.deepseek.com";
     bool search_enabled = false;
     int search_count = 5;
     int search_max_rounds = 3; // 防止模型无限调工具
+    std::string tool_fallback_base_url;
+    std::string tool_fallback_model;
+    std::string tool_fallback_key;
+    int tool_fallback_count = 0; // 统计触发了几次，便于观察中转是否修好
     /// 一轮对话：发请求 → 模型要工具 → 执行 → 回灌 → 再请求。
     /// 返回最终的 choices[0]（或错误对象）。
     Json::Value run_chat_with_tools(Json::Value request, size_t keyid,
                                     const msg_meta &conf);
+    /// 检测"声称调工具却没给 tool_calls"的畸形响应。
+    static bool is_malformed_tool_response(const Json::Value &resp);
     /// 工具定义列表（OpenAI tools 格式）。
     Json::Value build_tool_defs();
     /// 执行一次工具调用，返回喂回模型的文本。
