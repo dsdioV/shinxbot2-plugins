@@ -3,6 +3,7 @@
 #include <jsoncpp/json/json.h>
 #include <map>
 #include <set>
+#include <string>
 #include <vector>
 #include <mutex>
 
@@ -47,6 +48,27 @@ private:
                                        bool include_quote = false);
     bool message_mentions_bot(const std::string &message, const msg_meta &conf);
     bool message_has_wake_keyword(const std::string &message);
+
+    // ── 多模态：图片落盘 + 历史存引用 ──────────────────────────────
+    // 历史里绝不出现 base64（save_history 每轮全量重写，会被撑爆）。
+    // 图片字节存 config/gpt3_5/media/<sha256>.jpg（内容寻址，天然去重），
+    // 历史里只留内部标记
+    // {"type":"image_ref","file":"<sha256>.jpg","mime":"image/jpeg"}；
+    // 真正请求 API 时才展开成 data URI。
+    bool media_enabled = true;
+    int media_max_edge = 2048;
+    std::string media_dir() const;
+    /// 下载一张图、压到 media_max_edge 内、落盘，返回内部 image_ref part。
+    /// 失败返回 null（调用方跳过）。
+    Json::Value store_image(const std::string &url, const msg_meta &conf);
+    /// 把一段含 [CQ:image,...] 的文本拆成 parts，并补上被引用消息里的图。
+    /// 纯文本时返回 null（调用方按旧格式存字符串，保证向后兼容）。
+    Json::Value build_user_content(const std::string &message,
+                                   const msg_meta &conf, int64_t reply_id);
+    /// 内部 part（含 image_ref）→ OpenAI content 数组（图片展开成 data URI）。
+    Json::Value expand_content_for_api(const Json::Value &content);
+    /// 取纯文本视图：图片降级成 "[图片]"（压缩/摘要用）。
+    std::string content_to_text(const Json::Value &content);
     bool try_acquire_session(int64_t id, size_t keyid, const msg_meta &conf,
                              bool ensure_default_prompt = true);
     void release_session(size_t keyid);
@@ -65,6 +87,10 @@ private:
     int arc_check_counter = 0;
     bool arc_is_full = false;
 
+    /// 完整用法说明（.ai help / .ai.help 触发）。
+    /// bot.help 里只保留一行简述，避免刷屏。
+    void cmd_full_help(const msg_meta &conf);
+
 public:
     gpt3_5();
     size_t get_avaliable_key();
@@ -74,6 +100,7 @@ public:
     void process(std::string message, const msg_meta &conf) override;
     bool check(std::string message, const msg_meta &conf) override;
     std::string help() override;
+    std::string help(const msg_meta &conf, help_level_t level) override;
 };
 
 DECLARE_FACTORY_FUNCTIONS_HEADER

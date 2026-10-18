@@ -1,6 +1,8 @@
 #include "gpt3_5.h"
 #include "utils.h"
 
+#include <Magick++.h>
+
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -12,6 +14,139 @@
 #include <chrono>
 #include <algorithm>
 #include <cctype>
+
+namespace fs = std::filesystem;
+
+namespace {
+
+/// 标准 base64 编码。自己实现是为了不引入额外依赖：
+/// 插件仓的 lib/base64 是空 submodule，而 httplib 里那个在 detail 命名空间。
+std::string b64_encode(const std::string &in)
+{
+    static const char *tbl =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::string out;
+    out.reserve((in.size() + 2) / 3 * 4);
+    size_t i = 0;
+    while (i + 2 < in.size()) {
+        unsigned v = (static_cast<unsigned char>(in[i]) << 16) |
+                     (static_cast<unsigned char>(in[i + 1]) << 8) |
+                     static_cast<unsigned char>(in[i + 2]);
+        out += tbl[(v >> 18) & 0x3f];
+        out += tbl[(v >> 12) & 0x3f];
+        out += tbl[(v >> 6) & 0x3f];
+        out += tbl[v & 0x3f];
+        i += 3;
+    }
+    if (i + 1 == in.size()) {
+        unsigned v = static_cast<unsigned char>(in[i]) << 16;
+        out += tbl[(v >> 18) & 0x3f];
+        out += tbl[(v >> 12) & 0x3f];
+        out += "==";
+    }
+    else if (i + 2 == in.size()) {
+        unsigned v = (static_cast<unsigned char>(in[i]) << 16) |
+                     (static_cast<unsigned char>(in[i + 1]) << 8);
+        out += tbl[(v >> 18) & 0x3f];
+        out += tbl[(v >> 12) & 0x3f];
+        out += tbl[(v >> 6) & 0x3f];
+        out += '=';
+    }
+    return out;
+}
+
+/// 二进制安全的读文件。不能用框架的 readfile —— 它用 getline 逐行拼 "\n"，
+/// 会把图片字节改坏。
+std::string read_binary(const fs::path &path)
+{
+    std::ifstream f(path, std::ios::in | std::ios::binary);
+    if (!f.is_open()) return "";
+    std::ostringstream ss;
+    ss << f.rdbuf();
+    return ss.str();
+}
+
+/// 二进制安全的写文件（同理，不用框架的 writefile）。
+bool write_binary(const fs::path &path, const std::string &data)
+{
+    std::ofstream f(path, std::ios::out | std::ios::binary);
+    if (!f.is_open()) return false;
+    f.write(data.data(), static_cast<std::streamsize>(data.size()));
+    return f.good();
+}
+
+/// SHA-256（十六进制）。只用于图片内容寻址去重，不是安全用途。
+/// 自己实现是为了不给插件引入 OpenSSL 依赖。
+std::string sha256_hex(const std::string &data)
+{
+    static const uint32_t K[64] = {
+        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1,
+        0x923f82a4, 0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3,
+        0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786,
+        0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+        0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147,
+        0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13,
+        0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
+        0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+        0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a,
+        0x5b9cca4f, 0x682e6ff3, 0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208,
+        0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2};
+    auto rotr = [](uint32_t x, int n) { return (x >> n) | (x << (32 - n)); };
+
+    uint32_t h[8] = {0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
+                     0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19};
+
+    const uint64_t bit_len = static_cast<uint64_t>(data.size()) * 8;
+    std::vector<unsigned char> msg(data.begin(), data.end());
+    msg.push_back(0x80);
+    while (msg.size() % 64 != 56) msg.push_back(0x00);
+    for (int i = 7; i >= 0; --i) {
+        msg.push_back(static_cast<unsigned char>((bit_len >> (i * 8)) & 0xff));
+    }
+
+    for (size_t off = 0; off < msg.size(); off += 64) {
+        uint32_t w[64];
+        for (int i = 0; i < 16; ++i) {
+            w[i] = (static_cast<uint32_t>(msg[off + i * 4]) << 24) |
+                   (static_cast<uint32_t>(msg[off + i * 4 + 1]) << 16) |
+                   (static_cast<uint32_t>(msg[off + i * 4 + 2]) << 8) |
+                   (static_cast<uint32_t>(msg[off + i * 4 + 3]));
+        }
+        for (int i = 16; i < 64; ++i) {
+            uint32_t s0 =
+                rotr(w[i - 15], 7) ^ rotr(w[i - 15], 18) ^ (w[i - 15] >> 3);
+            uint32_t s1 =
+                rotr(w[i - 2], 17) ^ rotr(w[i - 2], 19) ^ (w[i - 2] >> 10);
+            w[i] = w[i - 16] + s0 + w[i - 7] + s1;
+        }
+        uint32_t a = h[0], b = h[1], c = h[2], d = h[3];
+        uint32_t e = h[4], f = h[5], g = h[6], hh = h[7];
+        for (int i = 0; i < 64; ++i) {
+            uint32_t S1 = rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25);
+            uint32_t ch = (e & f) ^ ((~e) & g);
+            uint32_t t1 = hh + S1 + ch + K[i] + w[i];
+            uint32_t S0 = rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22);
+            uint32_t maj = (a & b) ^ (a & c) ^ (b & c);
+            uint32_t t2 = S0 + maj;
+            hh = g; g = f; f = e; e = d + t1;
+            d = c; c = b; b = a; a = t1 + t2;
+        }
+        h[0] += a; h[1] += b; h[2] += c; h[3] += d;
+        h[4] += e; h[5] += f; h[6] += g; h[7] += hh;
+    }
+
+    static const char *hex = "0123456789abcdef";
+    std::string out;
+    out.reserve(64);
+    for (int i = 0; i < 8; ++i) {
+        for (int j = 7; j >= 0; --j) {
+            out.push_back(hex[(h[i] >> (j * 4)) & 0xf]);
+        }
+    }
+    return out;
+}
+
+} // namespace
 
 /**
  * Overall API intro: https://platform.openai.com/docs/api-reference/chat/create
@@ -173,12 +308,62 @@ void gpt3_5::save_file()
               J.toStyledString());
 }
 
-int64_t getlength(const Json::Value &J)
+/// 本地 token 估算。只在拿不到 API 的 usage 时用（首轮、压缩后）。
+///
+/// 为什么不用旧的 `content.length() / 0.75`：
+/// `std::string::length()` 返回**字节数**，一个汉字在 UTF-8 里占 3 字节，
+/// 于是中文被算成 3/0.75 = 4 token/字，而真实值约 1.5。高估 2.7 倍，
+/// 后果是压缩和裁剪触发得远比需要的早（4k 时代不易察觉）。
+///
+/// 这里按 Unicode 字符分类：ASCII ≈ 0.28 token/字符，非 ASCII ≈ 1.5 token/字符。
+static int64_t estimate_text_tokens(const std::string &s)
+{
+    int64_t ascii = 0, cjk = 0;
+    for (size_t i = 0; i < s.size();) {
+        unsigned char c = static_cast<unsigned char>(s[i]);
+        if (c < 0x80) {
+            ascii++;
+            i++;
+        }
+        else {
+            // UTF-8 多字节：按字符数算，不当成 3 个 token
+            int len = (c >= 0xF0) ? 4 : (c >= 0xE0) ? 3 : (c >= 0xC0) ? 2 : 1;
+            cjk++;
+            i += len;
+        }
+    }
+    return ascii * 28 / 100 + cjk * 3 / 2;
+}
+
+/// 一张图在主流视觉模型里的 token 开销。按 2048px 上限估算，取偏保守值。
+static const int64_t kImageTokens = 1100;
+
+/// 估算单条 content 的 token。图片按固定开销计，文字按字符类型加权。
+static int64_t content_tokens(const Json::Value &content)
+{
+    if (content.isString()) return estimate_text_tokens(content.asString());
+    if (!content.isArray()) return 0;
+
+    int64_t total = 0;
+    for (const auto &part : content) {
+        std::string type = part.get("type", "").asString();
+        if (type == "text") {
+            total += estimate_text_tokens(part.get("text", "").asString());
+        }
+        else if (type == "image_ref" || type == "image_url") {
+            total += kImageTokens;
+        }
+    }
+    return total;
+}
+
+/// 估算整个 messages 数组。数组形态（多模态）必须走 parts 估算，
+/// 否则 asString() 返回空串、估算归零，压缩和裁剪就永远不触发。
+static int64_t getlength(const Json::Value &J)
 {
     int64_t l = 0;
-    Json::ArrayIndex sz = J.size();
-    for (Json::ArrayIndex i = 0; i < sz; i++) {
-        l += J[i]["content"].asString().length() / 0.75;
+    for (const auto &msg : J) {
+        l += content_tokens(msg["content"]);
     }
     return l;
 }
@@ -350,7 +535,18 @@ bool gpt3_5::compress_history(int64_t id, size_t keyid, const msg_meta &conf,
         messages.append(prompt_messages[i]);
     }
     for (Json::ArrayIndex i = 0; i < older_history.size(); ++i) {
-        messages.append(older_history[i]);
+        Json::Value entry = older_history[i];
+        // 摘要是"读一遍旧对话再写总结"，不需要图片本身。
+        // 直接把 parts 拍平成文字（图片变 [图片]），避免请求体塞满 base64。
+        if (entry["content"].isArray()) {
+            Json::Value flat;
+            flat["role"] = entry["role"];
+            flat["content"] = content_to_text(entry["content"]);
+            messages.append(flat);
+        }
+        else {
+            messages.append(entry);
+        }
     }
 
     Json::Value user_msg;
@@ -860,6 +1056,13 @@ void gpt3_5::process(std::string message, const msg_meta &conf)
         }
     }
 
+    // 只有显式 .ai 前缀才算命令，避免私聊里正常问 "help" 被拦截
+    if (explicit_ai && (message == "help" || message == "帮助" ||
+                        message == ".help")) {
+        cmd_full_help(conf);
+        return;
+    }
+
     const std::vector<cmd_exact_rule> exact_rules = {
         {".test",
          [&]() {
@@ -1141,6 +1344,31 @@ void gpt3_5::process(std::string message, const msg_meta &conf)
                                                         reply_id, true);
     user_input_J["content"] = prompt_content;
 
+    // 有图时把 content 换成 parts 数组（图片就地落盘、历史里只存引用）。
+    // 纯文本时 build_user_content 返回 null，保持原来的字符串格式，
+    // 这样旧历史和新历史在磁盘上是同一种形状。
+    Json::Value parts = build_user_content(message, conf, reply_id);
+    if (!parts.isNull()) {
+        // 文字部分仍带上昵称/时间前缀，保持群聊语境
+        std::string prefix = prompt_content.substr(
+            0, prompt_content.size() > message.size()
+                   ? prompt_content.size() - message.size()
+                   : 0);
+        if (!parts.empty() && parts[0].get("type", "").asString() == "text") {
+            parts[0]["text"] = prefix + parts[0]["text"].asString();
+        }
+        else if (!prefix.empty()) {
+            Json::Value head;
+            head["type"] = "text";
+            head["text"] = prefix;
+            Json::Value merged(Json::arrayValue);
+            merged.append(head);
+            for (const auto &p : parts) merged.append(p);
+            parts = merged;
+        }
+        user_input_J["content"] = parts;
+    }
+
     J["model"] = model_name;
     
     {
@@ -1175,7 +1403,17 @@ void gpt3_5::process(std::string message, const msg_meta &conf)
         Json::Value K = mode_prompt[pre_default[id]];
         Json::ArrayIndex sz = h.size();
         for (Json::ArrayIndex i = 0; i < sz; i++) {
-            K.append(h[i]);
+            Json::Value entry = h[i];
+            // 历史里存的是 image_ref 引用，发给 API 前才展开成 data URI。
+            // 这样磁盘上的历史永远不含图片字节。
+            if (entry["content"].isArray()) {
+                entry["content"] = expand_content_for_api(entry["content"]);
+            }
+            K.append(entry);
+        }
+        if (user_input_J["content"].isArray()) {
+            user_input_J["content"] =
+                expand_content_for_api(user_input_J["content"]);
         }
         K.append(user_input_J);
         J["messages"] = K;
@@ -1237,7 +1475,17 @@ void gpt3_5::process(std::string message, const msg_meta &conf)
         if (trim(aimsg).empty()) {
             if (finish_reason == "content_filter") {
                 conf.p->cq_send("QAQ 响应被 OpenAI 安全策略过滤了", conf);
-            } else {
+            }
+            else if (finish_reason == "length") {
+                // 推理模型（如带 reasoning 的中转）会把 max_tokens 全花在
+                // 思考上，content 返回空串但 completion_tokens 非零。
+                // 这时说"空返回"是误导，实际是预算不够。
+                conf.p->cq_send(
+                    "模型把回复预算用在了思考上，没能输出正文。"
+                    "可用 .ai.set reply [更大的数值] 提高上限。",
+                    conf);
+            }
+            else {
                 conf.p->cq_send("API空返回！", conf);
             }
             return;
@@ -1298,7 +1546,14 @@ void gpt3_5::process(std::string message, const msg_meta &conf)
             J.clear();
             J["role"] = "assistant";
             J["content"] = aimsg;
-            history[id].append(user_input_J);
+            // 注意：user_input_J 的 content 在上面的请求组装里已经被展开成
+            // image_url（含 base64）。写回历史前必须换回未展开的 parts，
+            // 否则图片字节会被 save_history 固化进磁盘。
+            Json::Value stored_user = user_input_J;
+            if (!parts.isNull()) {
+                stored_user["content"] = parts;
+            }
+            history[id].append(stored_user);
             history[id].append(J);
         }
         conf.p->cq_send(reply_msg, conf);
@@ -1326,20 +1581,66 @@ bool gpt3_5::check(std::string message, const msg_meta &conf)
 
 std::string gpt3_5::help()
 {
-    return "OpenAI GPT-3.5：使用 .ai [内容] 或 @bot 开始对话\n"
-           "指令列表：\n"
-           ".ai.reset - 重置当前对话上下文\n"
-           ".ai.status - 以合并转发查看当前实际生效的模型/阈值/历史长度估算\n"
-           ".ai.compress - 压缩旧上下文并保留最近对话\n"
-           ".ai.change [模式] - 切换提示词模式\n"
-           ".ai.arc - 手动归档当前上下文\n"
-           ".ai.arc list [页码] - 查看归档列表（每页5条）\n"
-           ".ai.arc restore [编号/文件名] - 从归档中恢复上下文\n"
-           ".ai.sw - 仅 OP 可用, 关闭模型作维护用\n"
-           ".ai.awake at/keyword 0|1 - 切换 @bot/设置的 wake 关键词是否触发回复\n"
-           ".ai.set reply/token/red/compress [数值] - 修改回复、主上下文和压缩阈值\n"
-           "权限说明：归档与恢复功能在群聊中需 OP权限，私聊可直接使用。";
+    return "AI 对话：.ai [内容] 或 @bot。完整说明：.ai help";
 }
+
+// bot.help 会拼接所有插件的 help()，所以这里只给一行。
+// 分等级时也保持一行，细节留给 .ai help 按需查看。
+std::string gpt3_5::help(const msg_meta &conf, help_level_t level)
+{
+    (void)conf;
+    switch (level) {
+        case help_level_t::bot_admin:
+            return "AI 对话：.ai [内容] 或 @bot；.ai help 看全部。"
+                   "OP 另有 .ai.sw/.ai.set/.ai.arc";
+        case help_level_t::group_admin:
+            return "AI 对话：.ai [内容] 或 @bot；.ai help 看全部。"
+                   "本群管理员可用 .ai.arc 归档上下文";
+        case help_level_t::public_only:
+        default:
+            return help();
+    }
+}
+
+void gpt3_5::cmd_full_help(const msg_meta &conf)
+{
+    const bool is_group = conf.message_type == "group";
+    const bool can_manage = !is_group || conf.p->is_op(conf.user_id);
+
+    std::string body;
+    body += "闲聊\n"
+            "  .ai [内容]        和模型对话\n"
+            "  @bot [内容]       同上（群聊里 @ 即可）\n"
+            "  .ai help          显示本说明\n"
+            "\n"
+            "上下文\n"
+            "  .ai.status        以合并转发查看模型/阈值/历史估算\n"
+            "  .ai.compress      把旧上下文压成摘要，保留最近几轮\n"
+            "  .ai.reset         清空当前对话（备份里仍可找回）\n"
+            "  .ai.change [模式] 切换提示词模式（私聊或 OP）\n";
+
+    if (can_manage) {
+        body += "\n归档\n"
+                "  .ai.arc           手动归档当前上下文\n"
+                "  .ai.arc list [页] 查看归档列表（每页 5 条）\n"
+                "  .ai.arc restore [编号/文件名]  从归档恢复\n";
+    }
+
+    if (conf.p->is_op(conf.user_id)) {
+        body += "\nOP\n"
+                "  .ai.sw [原因]            关闭/开启模型（维护用）\n"
+                "  .ai.awake at|keyword 0|1 切换 @bot / 关键词触发\n"
+                "  .ai.set reply|token|red|compress [数值]  调整阈值\n"
+                "  .ai.debug               切换调试输出\n";
+    }
+
+    body +=
+        "\n提示：群聊里 @bot 会直接进入对话，不必加 .ai。\n"
+        "上下文超限时会自动压缩；也可随时 .ai.arc 手动存档。";
+
+    conf.p->cq_send(trim(body), conf);
+}
+
 
 uintmax_t gpt3_5::get_archives_total_size()
 {
@@ -1523,4 +1824,243 @@ void gpt3_5::restore_archive(int64_t id, const msg_meta &conf,
     }
 }
 
+// ───────────────────── 多模态：图片落盘 + 历史存引用 ─────────────────────
+
+std::string gpt3_5::media_dir() const
+{
+    return bot_config_path(nullptr, "gpt3_5/media");
+}
+
+/// 解析 [CQ:image,...] 里的 url 字段。QQ 的 url 带时效签名，必须当场下载。
+static std::string cq_image_url(const std::string &segment)
+{
+    size_t pos = segment.find("url=");
+    if (pos == std::string::npos) return "";
+    pos += 4;
+    size_t end = segment.find_first_of(",]", pos);
+    if (end == std::string::npos) end = segment.size();
+    return cq_decode(segment.substr(pos, end - pos));
+}
+
+Json::Value gpt3_5::store_image(const std::string &url,
+                                const msg_meta &conf)
+{
+    if (url.empty()) return Json::Value();
+
+    const std::string dir = media_dir();
+    // 临时名用 uuid，下载后再按内容命名，避免并发覆盖
+    const std::string tmp_name = generate_uuid();
+    const fs::path tmp_path = fs::path(dir) / (tmp_name + ".tmp");
+    try {
+        fs::create_directories(dir);
+        download(url, dir, tmp_name + ".tmp");
+    }
+    catch (const std::exception &e) {
+        conf.p->setlog(LOG::WARNING,
+                       std::string("openai: image download failed: ") + e.what());
+        return Json::Value();
+    }
+    catch (...) {
+        conf.p->setlog(LOG::WARNING, "openai: image download failed");
+        return Json::Value();
+    }
+
+    Json::Value part;
+    try {
+        // 空文件 / 极小的响应通常是 404 页面或鉴权失败，
+        // download() 内部对 HTTP 错误码不抛异常，会把错误页写进来。
+        {
+            std::error_code ec;
+            auto sz = fs::file_size(tmp_path, ec);
+            if (ec || sz < 64) {
+                conf.p->setlog(LOG::WARNING,
+                               "openai: image download returned no usable data");
+                fs::remove(tmp_path, ec);
+                return Json::Value();
+            }
+        }
+
+        // 入库时就压缩，避免历史里躺着 4000px 的原图。
+        // 注意：Geometry::aspect(true) 在 resize() 里不等于"保持比例"，
+        // 实测 4000x3000 会被拉成 2048x2048。这里自己算等比缩放。
+        Magick::Image img(tmp_path.string());
+        if (img.columns() > static_cast<size_t>(media_max_edge) ||
+            img.rows() > static_cast<size_t>(media_max_edge)) {
+            const double scale = std::min(
+                static_cast<double>(media_max_edge) / img.columns(),
+                static_cast<double>(media_max_edge) / img.rows());
+            const size_t w = std::max<size_t>(
+                1, static_cast<size_t>(img.columns() * scale));
+            const size_t h = std::max<size_t>(
+                1, static_cast<size_t>(img.rows() * scale));
+            img.resize(Magick::Geometry(w, h, 0, 0));
+        }
+
+        Magick::Blob blob;
+        img.magick("JPEG");
+        img.write(&blob);
+
+        std::string bytes(static_cast<const char *>(blob.data()), blob.length());
+        if (bytes.size() < 64) {
+            conf.p->setlog(LOG::WARNING, "openai: converted image is empty");
+            part = Json::Value();
+        }
+        else {
+            std::string sha = sha256_hex(bytes);
+            std::string fname = sha + ".jpg";
+            fs::path final_path = fs::path(dir) / fname;
+            if (!fs::exists(final_path)) {
+                write_binary(final_path, bytes);
+            }
+
+            part["type"] = "image_ref";
+            part["file"] = fname;
+            part["mime"] = "image/jpeg";
+        }
+    }
+    catch (const std::exception &e) {
+        conf.p->setlog(LOG::WARNING,
+                       std::string("openai: image convert failed: ") + e.what());
+        part = Json::Value();
+    }
+    catch (...) {
+        part = Json::Value();
+    }
+
+    std::error_code ec;
+    fs::remove(tmp_path, ec);
+    return part;
+}
+
+Json::Value gpt3_5::build_user_content(const std::string &message,
+                                      const msg_meta &conf, int64_t reply_id)
+{
+    if (!media_enabled) return Json::Value();
+
+    struct Segment {
+        bool is_image;
+        std::string text; // 图片时是 url
+    };
+    std::vector<Segment> segs;
+
+    static const std::regex cq_image_re(R"(\[CQ:image[^\]]*\])");
+    size_t last = 0;
+    for (auto it = std::sregex_iterator(message.begin(), message.end(),
+                                        cq_image_re);
+         it != std::sregex_iterator(); ++it) {
+        if (it->position() > last) {
+            segs.push_back({false, message.substr(last, it->position() - last)});
+        }
+        segs.push_back({true, cq_image_url(it->str())});
+        last = it->position() + it->length();
+    }
+    if (last < message.size()) {
+        segs.push_back({false, message.substr(last)});
+    }
+
+    // 被引用消息里的图：常见用法是「回复这张图问问题」
+    if (reply_id != -1) {
+        try {
+            Json::Value param;
+            param["message_id"] = reply_id;
+            Json::Value info =
+                string_to_json(conf.p->cq_send("get_msg", param));
+            if (info["retcode"].asInt() == 0 && info["data"].isMember("message")) {
+                std::string quoted = messageArr_to_string(info["data"]["message"]);
+                for (auto it = std::sregex_iterator(quoted.begin(), quoted.end(),
+                                                    cq_image_re);
+                     it != std::sregex_iterator(); ++it) {
+                    segs.push_back({true, cq_image_url(it->str())});
+                }
+            }
+        }
+        catch (...) {
+        }
+    }
+
+    bool has_image = std::any_of(segs.begin(), segs.end(),
+                                 [](const Segment &s) { return s.is_image; });
+    if (!has_image) return Json::Value(); // 纯文本：沿用旧格式
+
+    Json::Value content(Json::arrayValue);
+    for (const auto &s : segs) {
+        if (s.is_image) {
+            Json::Value part = store_image(s.text, conf);
+            if (part.isNull()) continue; // 下载/转换失败，跳过这张
+            content.append(part);
+        }
+        else {
+            std::string text = trim(s.text);
+            if (text.empty()) continue;
+            Json::Value part;
+            part["type"] = "text";
+            part["text"] = text;
+            content.append(part);
+        }
+    }
+    if (content.empty()) return Json::Value();
+    return content;
+}
+
+Json::Value gpt3_5::expand_content_for_api(const Json::Value &content)
+{
+    if (content.isString()) return content;
+    if (!content.isArray()) return content;
+
+    Json::Value out(Json::arrayValue);
+    for (const auto &part : content) {
+        std::string type = part.get("type", "").asString();
+        if (type != "image_ref") {
+            out.append(part);
+            continue;
+        }
+
+        const std::string file = part.get("file", "").asString();
+        const std::string mime = part.get("mime", "image/jpeg").asString();
+        fs::path path = fs::path(media_dir()) / file;
+        if (file.empty() || !fs::exists(path)) {
+            // 文件被清理掉了：降级成文字，别让整条请求失败
+            Json::Value fallback;
+            fallback["type"] = "text";
+            fallback["text"] = "[图片]";
+            out.append(fallback);
+            continue;
+        }
+
+        std::string bytes = read_binary(path);
+        if (bytes.empty()) {
+            Json::Value fallback;
+            fallback["type"] = "text";
+            fallback["text"] = "[图片]";
+            out.append(fallback);
+            continue;
+        }
+        Json::Value img;
+        img["type"] = "image_url";
+        img["image_url"]["url"] =
+            "data:" + mime + ";base64," + b64_encode(bytes);
+        out.append(img);
+    }
+    return out;
+}
+
+std::string gpt3_5::content_to_text(const Json::Value &content)
+{
+    if (content.isString()) return content.asString();
+    if (!content.isArray()) return "";
+
+    std::string out;
+    for (const auto &part : content) {
+        std::string type = part.get("type", "").asString();
+        if (type == "text") {
+            out += part.get("text", "").asString();
+        }
+        else if (type == "image_ref" || type == "image_url") {
+            out += "[图片]";
+        }
+    }
+    return out;
+}
+
 DECLARE_FACTORY_FUNCTIONS(gpt3_5)
+
