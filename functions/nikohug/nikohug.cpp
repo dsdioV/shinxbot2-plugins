@@ -250,12 +250,22 @@ void nikohug::process(std::string message, const msg_meta &conf)
     }
 
     const auto t_send_begin = ms_since();
+    std::size_t out_bytes = 0;
+    try {
+        out_bytes = static_cast<std::size_t>(fs::file_size(out_png));
+    }
+    catch (...) {
+    }
+    conf.p->setlog(LOG::INFO,
+                   fmt::format("nikohug SEND-BEGIN t={}ms bytes={} file={}",
+                               t_send_begin, out_bytes,
+                               fs::path(out_png).filename().string()));
     conf.p->cq_send(fmt::format("[CQ:image,file=file://{},id=40000]",
                                 fs::absolute(fs::path(out_png)).string()),
                     conf);
     conf.p->setlog(LOG::INFO,
-                   fmt::format("nikohug timing: send_call={}ms total_before_send={}ms",
-                               ms_since() - t_send_begin, t_send_begin));
+                   fmt::format("nikohug SEND-END t={}ms send_call={}ms",
+                               ms_since(), ms_since() - t_send_begin));
     conf.p->setlog(LOG::INFO,
                    fmt::format("nikohug at g{} by {} -> {}", conf.group_id,
                                conf.user_id, target));
