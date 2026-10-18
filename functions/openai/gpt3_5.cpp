@@ -1018,6 +1018,13 @@ void gpt3_5::process(std::string message, const msg_meta &conf)
 {
     if (conf.user_id == conf.p->get_botqq()) return;
 
+    // 诊断：确认消息真的进来了，以及它的原始形态（转发检测依赖这个）
+    set_global_log(LOG::INFO,
+                   "openai: recv type=" + conf.message_type +
+                       " user=" + std::to_string(conf.user_id) +
+                       " len=" + std::to_string(message.size()) +
+                       " head=" + message.substr(0, 120));
+
     int64_t reply_id = -1;
     strip_leading_reply_segment(message, reply_id);
 
