@@ -1019,7 +1019,9 @@ void gpt3_5::process(std::string message, const msg_meta &conf)
     if (conf.user_id == conf.p->get_botqq()) return;
 
     // 诊断：确认消息真的进来了，以及它的原始形态（转发检测依赖这个）
-    set_global_log(LOG::INFO,
+    // 用 conf.p->setlog 而不是 set_global_log：后者只打 stdout，
+    // 而 bot 的日志是写文件的（log/<qq>/<date>/info.log）
+    conf.p->setlog(LOG::INFO,
                    "openai: recv type=" + conf.message_type +
                        " user=" + std::to_string(conf.user_id) +
                        " len=" + std::to_string(message.size()) +
@@ -2015,7 +2017,7 @@ void gpt3_5::collect_images_from_message(const Json::Value &msg,
     }
 }
 
-void gpt3_5::collect_forward_images(const bot *p, const std::string &forward_id,
+void gpt3_5::collect_forward_images(bot *p, const std::string &forward_id,
                                     std::vector<std::string> &urls, int depth)
 {
     if (depth > 5) return; // 和文本展开的深度上限保持一致
@@ -2026,18 +2028,18 @@ void gpt3_5::collect_forward_images(const bot *p, const std::string &forward_id,
         info = string_to_json(p->cq_send("get_forward_msg", param));
     }
     catch (const std::string &e) {
-        set_global_log(LOG::WARNING,
+        p->setlog(LOG::WARNING,
                "openai: get_forward_msg threw: " + e);
         return;
     }
     catch (...) {
-        set_global_log(LOG::WARNING, "openai: get_forward_msg threw (unknown)");
+        p->setlog(LOG::WARNING, "openai: get_forward_msg threw (unknown)");
         return;
     }
 
     // 诊断：转发取不到图时，先看清楚 NapCat 到底返回了什么形状
     if (info["retcode"].asInt() != 0 || !info.isMember("data")) {
-        set_global_log(LOG::WARNING,
+        p->setlog(LOG::WARNING,
                "openai: forward retcode=" +
                    std::to_string(info["retcode"].asInt()) +
                    " has_data=" + std::to_string(info.isMember("data")) +
@@ -2049,7 +2051,7 @@ void gpt3_5::collect_forward_images(const bot *p, const std::string &forward_id,
     const Json::Value &messages =
         data.isMember("messages") ? data["messages"] : data;
     if (!messages.isArray()) {
-        set_global_log(LOG::WARNING,
+        p->setlog(LOG::WARNING,
                "openai: forward data is not array, keys=" +
                    Json::writeString(Json::StreamWriterBuilder(), data)
                        .substr(0, 200));
@@ -2059,13 +2061,13 @@ void gpt3_5::collect_forward_images(const bot *p, const std::string &forward_id,
     if (depth == 0) {
         // 只打第一条消息的形状，够判断字段名了
         if (!messages.empty()) {
-            set_global_log(LOG::INFO,
+            p->setlog(LOG::INFO,
                    "openai: forward sample node=" +
                        Json::writeString(Json::StreamWriterBuilder(),
                                          messages[0])
                            .substr(0, 400));
         }
-        set_global_log(LOG::INFO,
+        p->setlog(LOG::INFO,
                "openai: forward nodes=" + std::to_string(messages.size()));
     }
 
@@ -2102,7 +2104,7 @@ void gpt3_5::collect_forward_images(const bot *p, const std::string &forward_id,
         }
     }
     if (depth == 0) {
-        set_global_log(LOG::INFO,
+        p->setlog(LOG::INFO,
                "openai: forward images extracted=" +
                    std::to_string(urls.size() - before));
     }

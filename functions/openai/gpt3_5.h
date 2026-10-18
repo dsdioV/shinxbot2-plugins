@@ -98,7 +98,7 @@ private:
                                    const msg_meta &conf, int64_t reply_id);
     /// 收集合并转发里的图片 URL（递归展开，带深度上限）。
     /// 转到的是展开后的文本里那些 [图片] 占位符对应的真实图片。
-    void collect_forward_images(const bot *p, const std::string &forward_id,
+    void collect_forward_images(bot *p, const std::string &forward_id,
                                 std::vector<std::string> &urls, int depth);
     /// 从一条消息的 message 数组里抽出图片 URL。
     void collect_images_from_message(const Json::Value &msg,
