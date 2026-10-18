@@ -57,6 +57,25 @@ private:
     // 真正请求 API 时才展开成 data URI。
     bool media_enabled = true;
     int media_max_edge = 2048;
+
+    // ── 工具调用（web search）──────────────────────────────────────
+    // 走 OpenAI 原生 tools / tool_calls，不是"猜关键词再搜"的固定流程。
+    // 这也是以后接 MCP 的同一套地基：加工具 = 往 tools 里多塞一个定义。
+    std::string search_api_key;
+    std::string search_base_url = "https://api.deepseek.com";
+    bool search_enabled = false;
+    int search_count = 5;
+    int search_max_rounds = 3; // 防止模型无限调工具
+    /// 一轮对话：发请求 → 模型要工具 → 执行 → 回灌 → 再请求。
+    /// 返回最终的 choices[0]（或错误对象）。
+    Json::Value run_chat_with_tools(Json::Value request, size_t keyid,
+                                    const msg_meta &conf);
+    /// 工具定义列表（OpenAI tools 格式）。
+    Json::Value build_tool_defs();
+    /// 执行一次工具调用，返回喂回模型的文本。
+    std::string exec_tool_call(const Json::Value &call, const msg_meta &conf);
+    /// DeepSeek Search API。
+    std::string tool_web_search(const std::string &query, const msg_meta &conf);
     std::string media_dir() const;
     /// 下载一张图、压到 media_max_edge 内、落盘，返回内部 image_ref part。
     /// 失败返回 null（调用方跳过）。

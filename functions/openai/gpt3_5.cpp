@@ -253,6 +253,19 @@ gpt3_5::gpt3_5()
         wake_keywords.push_back("vvm");
     }
 
+    // 搜索工具：没有 key 就保持禁用，不影响其余功能
+    search_api_key = res.get("search_api_key", "").asString();
+    search_base_url =
+        res.get("search_base_url", "https://api.deepseek.com").asString();
+    search_enabled = res.get("search_enabled", false).asBool() &&
+                     !trim(search_api_key).empty();
+    search_count = res.get("search_count", 5).asInt();
+    if (search_count < 1) search_count = 1;
+    if (search_count > 20) search_count = 20;
+    search_max_rounds = res.get("search_max_rounds", 3).asInt();
+    if (search_max_rounds < 1) search_max_rounds = 1;
+    if (search_max_rounds > 5) search_max_rounds = 5;
+
     is_open = true;
     is_debug = false;
     key_cycle = 0;
@@ -301,6 +314,12 @@ void gpt3_5::save_file()
     J["MAX_TOKEN"] = MAX_TOKEN;
     J["MAX_REPLY"] = MAX_REPLY;
     J["RED_LINE"] = RED_LINE;
+    // 搜索相关必须一起写回，否则任何一次 .ai.set 都会把它们抹掉
+    J["search_api_key"] = search_api_key;
+    J["search_base_url"] = search_base_url;
+    J["search_enabled"] = search_enabled;
+    J["search_count"] = search_count;
+    J["search_max_rounds"] = search_max_rounds;
     for (const std::string &u : modes) {
         J[u] = mode_prompt[u];
     }
@@ -1312,6 +1331,20 @@ void gpt3_5::process(std::string message, const msg_meta &conf)
                 reply += "reply_on_at: " + std::to_string(reply_on_at) + "\n";
                 reply += "reply_on_keyword: " +
                          std::to_string(reply_on_keyword) + "\n";
+                reply += "web_search: " +
+                         std::string(search_enabled ? "enabled" : "disabled");
+                if (search_enabled) {
+                    reply += " (count=" + std::to_string(search_count) +
+                             ", max_rounds=" +
+                             std::to_string(search_max_rounds) + ")";
+                }
+                else if (trim(search_api_key).empty()) {
+                    reply += " (未配置 search_api_key)";
+                }
+                else {
+                    reply += " (search_enabled=false)";
+                }
+                reply += "\n";
                 reply += "note: request order is prompt -> active history -> current user";
             }
             send_forward_text(reply, conf, "AI Status");
@@ -1421,20 +1454,9 @@ void gpt3_5::process(std::string message, const msg_meta &conf)
     
     J["temperature"] = 0.7;
     J["max_tokens"] = MAX_REPLY;
-    try {
-        J = string_to_json(do_post(base_url, "/v1/chat/completions", false, J,
-                                   {{"Content-Type", "application/json"},
-                                    {"Authorization", "Bearer " + key[keyid]}},
-                                   true));
-    }
-    catch (std::string e) {
-        J.clear();
-        J["error"]["message"] = e;
-    }
-    catch (...) {
-        J.clear();
-        J["error"]["message"] = "http connection failed.";
-    }
+    // 走工具循环：模型可以自己决定搜不搜、搜什么、要不要再搜一次。
+    // 没有启用搜索时 build_tool_defs 返回空，行为与原来完全一致。
+    J = run_chat_with_tools(J, keyid, conf);
     conf.p->setlog(LOG::INFO, "openai: user " + std::to_string(conf.user_id));
     
     {
@@ -1611,6 +1633,8 @@ void gpt3_5::cmd_full_help(const msg_meta &conf)
     body += "闲聊\n"
             "  .ai [内容]        和模型对话\n"
             "  @bot [内容]       同上（群聊里 @ 即可）\n"
+            "  直接发图          模型能看图，支持追问同一张图\n"
+            "  回复某张图再问    会把被引用消息里的图一并带上\n"
             "  .ai help          显示本说明\n"
             "\n"
             "上下文\n"
@@ -1637,6 +1661,11 @@ void gpt3_5::cmd_full_help(const msg_meta &conf)
     body +=
         "\n提示：群聊里 @bot 会直接进入对话，不必加 .ai。\n"
         "上下文超限时会自动压缩；也可随时 .ai.arc 手动存档。";
+
+    if (search_enabled) {
+        body += "\n联网搜索已启用：需要实时信息时模型会自己调 web_search，"
+                "你不用特别说明。";
+    }
 
     conf.p->cq_send(trim(body), conf);
 }
@@ -2060,6 +2089,195 @@ std::string gpt3_5::content_to_text(const Json::Value &content)
         }
     }
     return out;
+}
+
+// ───────────────────── 工具调用（web search）─────────────────────
+
+Json::Value gpt3_5::build_tool_defs()
+{
+    Json::Value tools(Json::arrayValue);
+    if (!search_enabled) return tools;
+
+    Json::Value tool;
+    tool["type"] = "function";
+    Json::Value &f = tool["function"];
+    f["name"] = "web_search";
+    f["description"] =
+        "搜索互联网获取实时信息。当问题涉及新闻、近期事件、具体数据、"
+        "或你不确定的事实（尤其是训练数据之后发生的事）时使用。"
+        "返回结果的标题、链接和摘要。可以多次调用以换用不同关键词。";
+
+    Json::Value &params = f["parameters"];
+    params["type"] = "object";
+    params["properties"]["query"]["type"] = "string";
+    params["properties"]["query"]["description"] =
+        "搜索关键词，支持 site: / -site: / after: 等语法";
+    params["required"].append("query");
+    params["additionalProperties"] = false;
+
+    tools.append(tool);
+    return tools;
+}
+
+std::string gpt3_5::tool_web_search(const std::string &query,
+                                    const msg_meta &conf)
+{
+    if (!search_enabled) return "搜索功能未启用。";
+
+    std::string q = trim(query);
+    if (q.empty()) return "搜索关键词为空。";
+
+    Json::Value req;
+    req["query"] = q;
+    req["count"] = search_count;
+    // 摘要（600~800 字符）比 snippet 更适合喂模型，正文按需才取
+    req["need_content"] = false;
+
+    Json::Value resp;
+    try {
+        resp = string_to_json(do_post(
+            search_base_url, "/v1/tools/search", false, req,
+            {{"Content-Type", "application/json"},
+             {"Authorization", "Bearer " + search_api_key}},
+            false));
+    }
+    catch (const std::string &e) {
+        conf.p->setlog(LOG::WARNING, "openai: web_search failed: " + e);
+        // 把失败明确告诉模型，让它自己决定换词重试还是如实说搜不到
+        return "搜索失败（接口报错），请换一个关键词重试，或直接说明无法检索。";
+    }
+    catch (...) {
+        conf.p->setlog(LOG::WARNING, "openai: web_search failed (unknown)");
+        return "搜索失败（连接异常），请稍后重试或说明无法检索。";
+    }
+
+    if (resp.isMember("error")) {
+        std::string msg = resp["error"].isMember("message")
+                              ? resp["error"]["message"].asString()
+                              : "unknown error";
+        conf.p->setlog(LOG::WARNING, "openai: web_search api error: " + msg);
+        return "搜索接口返回错误：" + msg;
+    }
+
+    const Json::Value &results = resp["results"];
+    if (!results.isArray() || results.empty()) {
+        return "没有找到「" + q + "」的相关结果。";
+    }
+
+    Json::Value out(Json::arrayValue);
+    int idx = 0;
+    for (const auto &r : results) {
+        if (++idx > search_count) break;
+        Json::Value item;
+        item["title"] = r.get("title", "").asString();
+        item["url"] = r.get("url", "").asString();
+        // summary 比 snippet 信息量大，模型读这个
+        std::string body = r.get("summary", "").asString();
+        if (body.empty()) body = r.get("snippet", "").asString();
+        item["summary"] = body;
+        std::string date = r.get("date", "").asString();
+        if (!date.empty()) item["date"] = date;
+        out.append(item);
+    }
+
+    Json::StreamWriterBuilder wb;
+    wb["indentation"] = "  ";
+    wb["emitUTF8"] = true;
+    return "搜索结果（" + q + "）：\n" +
+           Json::writeString(wb, out);
+}
+
+std::string gpt3_5::exec_tool_call(const Json::Value &call,
+                                   const msg_meta &conf)
+{
+    std::string name = call["function"]["name"].asString();
+    std::string raw_args = call["function"]["arguments"].asString();
+
+    Json::Value args;
+    try {
+        args = string_to_json(raw_args);
+    }
+    catch (...) {
+        // 模型偶尔给出非法 JSON，别让整轮对话挂掉
+        return "工具参数解析失败，请重新组织参数后重试。";
+    }
+
+    if (name == "web_search") {
+        return tool_web_search(args.get("query", "").asString(), conf);
+    }
+    return "未知工具：" + name;
+}
+
+Json::Value gpt3_5::run_chat_with_tools(Json::Value request, size_t keyid,
+                                       const msg_meta &conf)
+{
+    Json::Value tools = build_tool_defs();
+    if (!tools.empty()) {
+        request["tools"] = tools;
+        request["tool_choice"] = "auto";
+    }
+
+    Json::Value resp;
+    int rounds = 0;
+    while (true) {
+        try {
+            resp = string_to_json(do_post(
+                base_url, "/v1/chat/completions", false, request,
+                {{"Content-Type", "application/json"},
+                 {"Authorization", "Bearer " + key[keyid]}},
+                true));
+        }
+        catch (const std::string &e) {
+            Json::Value err;
+            err["error"]["message"] = e;
+            return err;
+        }
+        catch (...) {
+            Json::Value err;
+            err["error"]["message"] = "http connection failed.";
+            return err;
+        }
+
+        if (resp.isMember("error")) return resp;
+        if (!resp.isMember("choices") || !resp["choices"].isArray() ||
+            resp["choices"].empty()) {
+            return resp;
+        }
+
+        const Json::Value &msg = resp["choices"][0]["message"];
+        const Json::Value &calls = msg["tool_calls"];
+
+        // 没有工具调用 = 正常结束
+        if (!calls.isArray() || calls.empty()) return resp;
+
+        // 防止模型无限调工具烧钱
+        if (rounds >= search_max_rounds) {
+            conf.p->setlog(LOG::WARNING,
+                           "openai: tool call round limit reached");
+            return resp;
+        }
+        rounds++;
+
+        // 把 assistant 的 tool_calls 原样追加进对话，再逐条回灌结果
+        Json::Value history_msgs = request["messages"];
+        Json::Value assistant_msg;
+        assistant_msg["role"] = "assistant";
+        assistant_msg["content"] = msg.get("content", Json::Value());
+        assistant_msg["tool_calls"] = calls;
+        history_msgs.append(assistant_msg);
+
+        for (const auto &call : calls) {
+            std::string result = exec_tool_call(call, conf);
+            Json::Value tool_msg;
+            tool_msg["role"] = "tool";
+            tool_msg["tool_call_id"] = call.get("id", "").asString();
+            tool_msg["content"] = result;
+            history_msgs.append(tool_msg);
+        }
+
+        request["messages"] = history_msgs;
+        // 工具轮次不再需要重复附上 tools（部分中转会报错），保持简洁
+    }
 }
 
 DECLARE_FACTORY_FUNCTIONS(gpt3_5)
