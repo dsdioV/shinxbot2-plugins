@@ -2018,16 +2018,51 @@ void gpt3_5::collect_forward_images(const bot *p, const std::string &forward_id,
     try {
         info = string_to_json(p->cq_send("get_forward_msg", param));
     }
-    catch (...) {
+    catch (const std::string &e) {
+        set_global_log(LOG::WARNING,
+               "openai: get_forward_msg threw: " + e);
         return;
     }
-    if (info["retcode"].asInt() != 0 || !info.isMember("data")) return;
+    catch (...) {
+        set_global_log(LOG::WARNING, "openai: get_forward_msg threw (unknown)");
+        return;
+    }
+
+    // 诊断：转发取不到图时，先看清楚 NapCat 到底返回了什么形状
+    if (info["retcode"].asInt() != 0 || !info.isMember("data")) {
+        set_global_log(LOG::WARNING,
+               "openai: forward retcode=" +
+                   std::to_string(info["retcode"].asInt()) +
+                   " has_data=" + std::to_string(info.isMember("data")) +
+                   " body=" + info.toStyledString().substr(0, 300));
+        return;
+    }
 
     const Json::Value &data = info["data"];
     const Json::Value &messages =
         data.isMember("messages") ? data["messages"] : data;
-    if (!messages.isArray()) return;
+    if (!messages.isArray()) {
+        set_global_log(LOG::WARNING,
+               "openai: forward data is not array, keys=" +
+                   Json::writeString(Json::StreamWriterBuilder(), data)
+                       .substr(0, 200));
+        return;
+    }
 
+    if (depth == 0) {
+        // 只打第一条消息的形状，够判断字段名了
+        if (!messages.empty()) {
+            set_global_log(LOG::INFO,
+                   "openai: forward sample node=" +
+                       Json::writeString(Json::StreamWriterBuilder(),
+                                         messages[0])
+                           .substr(0, 400));
+        }
+        set_global_log(LOG::INFO,
+               "openai: forward nodes=" + std::to_string(messages.size()));
+    }
+
+    const size_t before = urls.size();
     for (const auto &m : messages) {
         if (!m.isObject()) continue;
         if (m.isMember("message")) {
@@ -2058,6 +2093,11 @@ void gpt3_5::collect_forward_images(const bot *p, const std::string &forward_id,
                 collect_forward_images(p, (*it)[1].str(), urls, depth + 1);
             }
         }
+    }
+    if (depth == 0) {
+        set_global_log(LOG::INFO,
+               "openai: forward images extracted=" +
+                   std::to_string(urls.size() - before));
     }
 }
 
