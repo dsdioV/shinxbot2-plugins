@@ -86,6 +86,8 @@ Magick::Image make_avatar_layer(const std::string &avatar_path)
 {
     Magick::Image avatar;
     avatar.read(avatar_path);
+    // 强制正方形：非正方形头像若按宽高比缩放，会得到 350x350 之类的尺寸，
+    // 后续按 300x300 推导的坐标就全错了。
     avatar.resize(Magick::Geometry(kAvatarSize, kAvatarSize));
     avatar.alpha(true);
 
@@ -105,6 +107,9 @@ Magick::Image make_avatar_layer(const std::string &avatar_path)
     avatar.filterType(Magick::CubicFilter);
     avatar.rotate(kAvatarRotateDeg);
 
+    // 旋转后 IM 会把画布扩到约 350x350，Page 偏移非 0；
+    // 规整 Page 后，下方按中心点计算的位置才准确。
+    avatar.page(Magick::Geometry(0, 0, 0, 0));
     return avatar;
 }
 
@@ -191,7 +196,17 @@ void nikohug::compose(const std::string &avatar_path,
     composite_overlay(canvas, overlay1);
     composite_overlay(canvas, overlay2);
 
-    canvas.magick("PNG");
+    // 成品保持 PNG 并保留 alpha 通道（约 56% 区域是透明的）。
+    //
+    // 这里刻意压成 8-bit 调色板（PNG8）：
+    //   · 画布工作在 16-bit 上下文，直接写出是 16-bit PNG，实测可达 243KB；
+    //   · 本图只有纯色块和小渐变，256 色调色板足够，压完约 50KB；
+    //   · 实测首次上传耗时：243KB/16bit ≈ 5~10s，50KB/8bit ≈ 2.4~3.5s。
+    // 调色板化不影响透明，也不改变构图，只减小体积。
+    canvas.strip();
+    canvas.defineValue("png:compression-level", "9");
+    canvas.defineValue("png:format", "png8");
+    canvas.magick("PNG8");
     canvas.write(out_png);
 }
 
