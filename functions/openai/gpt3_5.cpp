@@ -1982,27 +1982,59 @@ Json::Value gpt3_5::store_image(const std::string &url,
     return part;
 }
 
+/// 递归扫描任意 JSON 结构，找出所有看起来像图片节点的对象。
+///
+/// 为什么要递归而不是按 type 判断：NapCat 在「回复一条合并转发」时
+/// 返回的不是 [CQ:forward,id=...]，而是把转发节点的内容**直接内联展开**，
+/// 且这些内联节点没有 type 字段。实测结构：
+///   data.message[0].data.content[0].message[0].data = {file, url, file_size, ...}
+/// 只认 type=="image" 会漏掉全部图片。
+///
+/// 判定规则：一个对象同时满足
+///   - 有 url 字段且非空
+///   - 有 file 或 file_size 字段（避免把无关的外链当成图片）
+static void scan_for_image_urls(const Json::Value &node,
+                                std::vector<std::string> &urls, int depth)
+{
+    if (depth > 8) return;
+
+    if (node.isArray()) {
+        for (const auto &item : node) {
+            scan_for_image_urls(item, urls, depth + 1);
+        }
+        return;
+    }
+    if (!node.isObject()) return;
+
+    const Json::Value &data = node["data"];
+    if (data.isObject()) {
+        std::string url = data.get("url", "").asString();
+        const bool looks_image =
+            !url.empty() &&
+            (data.isMember("file") || data.isMember("file_size") ||
+             data.get("sub_type", Json::Value()).isInt());
+        if (looks_image) {
+            // 去重：同一张图可能在多个层级重复出现
+            if (std::find(urls.begin(), urls.end(), url) == urls.end()) {
+                urls.push_back(url);
+            }
+        }
+    }
+
+    // 继续向下找：message / content / data 都可能嵌套
+    for (const char *key : {"message", "content", "data", "messages"}) {
+        if (node.isMember(key)) {
+            scan_for_image_urls(node[key], urls, depth + 1);
+        }
+    }
+}
+
 /// 从一条消息的 message/content（messageArr 或 CQ 字符串）里抽出图片 URL。
 void gpt3_5::collect_images_from_message(const Json::Value &msg,
                                          std::vector<std::string> &urls)
 {
-    if (msg.isArray()) {
-        // 标准 messageArr：[{type:"image", data:{file,url,...}}]
-        for (const auto &seg : msg) {
-            if (!seg.isObject()) continue;
-            std::string type = seg.get("type", "").asString();
-            if (type != "image") {
-                // 嵌套转发
-                if (type == "forward") continue;
-                continue;
-            }
-            const Json::Value &data = seg["data"];
-            if (!data.isObject()) continue;
-            // 优先 url；没有就退回 file（可能是本地路径或文件名）
-            std::string url = data.get("url", "").asString();
-            if (url.empty()) url = data.get("file", "").asString();
-            if (!url.empty()) urls.push_back(url);
-        }
+    if (msg.isArray() || msg.isObject()) {
+        scan_for_image_urls(msg, urls, 0);
         return;
     }
 
@@ -2074,14 +2106,11 @@ void gpt3_5::collect_forward_images(bot *p, const std::string &forward_id,
     const size_t before = urls.size();
     for (const auto &m : messages) {
         if (!m.isObject()) continue;
-        if (m.isMember("message")) {
-            collect_images_from_message(m["message"], urls);
-        }
-        else if (m.isMember("content")) {
-            collect_images_from_message(m["content"], urls);
-        }
+        // 整条 node 丢进去递归扫描：NapCat 的节点结构不固定，
+        // 图片可能在 message / content / data 任意一层
+        collect_images_from_message(m, urls);
 
-        // 嵌套转发：data.content 里可能还有 [CQ:forward,id=...]
+        // 嵌套转发：显式的 [CQ:forward,id=...] 还是要去 fetch
         const Json::Value &body =
             m.isMember("message") ? m["message"] : m["content"];
         if (body.isArray()) {
@@ -2158,7 +2187,13 @@ Json::Value gpt3_5::build_user_content(const std::string &message,
             if (info["retcode"].asInt() == 0 &&
                 info["data"].isMember("message")) {
                 const Json::Value &quoted_msg = info["data"]["message"];
+                // 递归扫描：被引用消息可能是普通图，也可能是 NapCat
+                // 内联展开的转发节点（没有 [CQ:forward，也没有 type 字段）
                 collect_images_from_message(quoted_msg, quoted_images);
+                conf.p->setlog(
+                    LOG::INFO,
+                    "openai: quoted images found=" +
+                        std::to_string(quoted_images.size()));
 
                 // 引用的消息本身是转发：展开里面的图
                 std::string quoted = messageArr_to_string(quoted_msg);
