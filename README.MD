@@ -42,6 +42,8 @@
 
 - 管理多个bot，并（以后）可以通过广播传递消息
 
+- Niko 抱抱（合成头像图）。素材来源：[player233lol/qq_nikohugapi](https://github.com/player233lol/qq_nikohugapi)，CC-BY-NC 4.0
+
 ## 编译：
 
 在 `functions|events` 目录下执行 `python generate_cmake.py`，然后 `./make_all.sh`。会将功能编译成`.so`放在`./lib/functions`和`./lib/events`下。将这两个文件夹复制到框架仓的`./lib/`下既可。

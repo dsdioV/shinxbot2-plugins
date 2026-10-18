@@ -22,6 +22,8 @@ Plugins repo for [shinxbot2](https://github.com/Jayfeather233/shinxbot2).
 - Graylist Management
 - Manage multiple bots, with future capability to broadcast messages
 
+- Niko Hug (avatar compositing). Assets: [player233lol/qq_nikohugapi](https://github.com/player233lol/qq_nikohugapi), CC-BY-NC 4.0
+
 ## Compile
 
 Run `python generate_cmake.py` under `functions|events`, then run `./make_all.sh`. It will compile plugins into `.so` files under `./lib/functions` and `./lib/events` direcories. Copy them into shinxbot2 repo `./lib/`.

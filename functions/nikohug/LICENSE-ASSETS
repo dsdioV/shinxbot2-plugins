@@ -1,0 +1,28 @@
+本目录下 data/0.png 与 data/1.png 的授权声明
+=====================================================
+
+素材来源
+    player233lol/qq_nikohugapi
+    https://github.com/player233lol/qq_nikohugapi
+    文件: data/0.png, data/1.png
+
+作者
+    player233lol
+
+许可
+    CC-BY-NC 4.0 (Creative Commons Attribution-NonCommercial 4.0
+    International) —— 署名—非商业性使用 4.0 国际
+    https://creativecommons.org/licenses/by-nc/4.0/
+
+许可要点
+    1. 署名 (BY): 分发或展示时必须注明上述作者与来源。
+    2. 非商业 (NC): 不得用于商业目的。若把本插件用于收费服务、
+       收费群组、付费产品或其他营利场景，需另行取得作者授权。
+
+    CC-BY-NC 4.0 不是「自由软件」许可证，不应被视为与 GPL/LGPL
+    等自由软件许可兼容；本插件仅以「插件功能」形式附带该素材，
+    未修改素材本身。
+
+上游代码部分
+    qq_nikohugapi 的代码作者声明为 CC0；本插件是对其算法的独立
+    C++ 重写，未复制其 Python 源码。
