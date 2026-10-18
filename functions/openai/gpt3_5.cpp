@@ -1973,6 +1973,94 @@ Json::Value gpt3_5::store_image(const std::string &url,
     return part;
 }
 
+/// 从一条消息的 message/content（messageArr 或 CQ 字符串）里抽出图片 URL。
+void gpt3_5::collect_images_from_message(const Json::Value &msg,
+                                         std::vector<std::string> &urls)
+{
+    if (msg.isArray()) {
+        // 标准 messageArr：[{type:"image", data:{file,url,...}}]
+        for (const auto &seg : msg) {
+            if (!seg.isObject()) continue;
+            std::string type = seg.get("type", "").asString();
+            if (type != "image") {
+                // 嵌套转发
+                if (type == "forward") continue;
+                continue;
+            }
+            const Json::Value &data = seg["data"];
+            if (!data.isObject()) continue;
+            // 优先 url；没有就退回 file（可能是本地路径或文件名）
+            std::string url = data.get("url", "").asString();
+            if (url.empty()) url = data.get("file", "").asString();
+            if (!url.empty()) urls.push_back(url);
+        }
+        return;
+    }
+
+    // 字符串形态：CQ 码
+    std::string s = msg.isString() ? msg.asString() : "";
+    if (s.empty()) return;
+    static const std::regex cq_image_re(R"(\[CQ:image[^\]]*\])");
+    for (auto it = std::sregex_iterator(s.begin(), s.end(), cq_image_re);
+         it != std::sregex_iterator(); ++it) {
+        std::string url = cq_image_url(it->str());
+        if (!url.empty()) urls.push_back(url);
+    }
+}
+
+void gpt3_5::collect_forward_images(const bot *p, const std::string &forward_id,
+                                    std::vector<std::string> &urls, int depth)
+{
+    if (depth > 5) return; // 和文本展开的深度上限保持一致
+    Json::Value param;
+    param["id"] = forward_id;
+    Json::Value info;
+    try {
+        info = string_to_json(p->cq_send("get_forward_msg", param));
+    }
+    catch (...) {
+        return;
+    }
+    if (info["retcode"].asInt() != 0 || !info.isMember("data")) return;
+
+    const Json::Value &data = info["data"];
+    const Json::Value &messages =
+        data.isMember("messages") ? data["messages"] : data;
+    if (!messages.isArray()) return;
+
+    for (const auto &m : messages) {
+        if (!m.isObject()) continue;
+        if (m.isMember("message")) {
+            collect_images_from_message(m["message"], urls);
+        }
+        else if (m.isMember("content")) {
+            collect_images_from_message(m["content"], urls);
+        }
+
+        // 嵌套转发：data.content 里可能还有 [CQ:forward,id=...]
+        const Json::Value &body =
+            m.isMember("message") ? m["message"] : m["content"];
+        if (body.isArray()) {
+            for (const auto &seg : body) {
+                if (!seg.isObject()) continue;
+                if (seg.get("type", "").asString() != "forward") continue;
+                std::string nested = seg["data"].get("id", "").asString();
+                if (!nested.empty()) {
+                    collect_forward_images(p, nested, urls, depth + 1);
+                }
+            }
+        }
+        else if (body.isString()) {
+            static const std::regex fwd_re(R"(\[CQ:forward,id=([^,\]]+))");
+            const std::string s = body.asString();
+            for (auto it = std::sregex_iterator(s.begin(), s.end(), fwd_re);
+                 it != std::sregex_iterator(); ++it) {
+                collect_forward_images(p, (*it)[1].str(), urls, depth + 1);
+            }
+        }
+    }
+}
+
 Json::Value gpt3_5::build_user_content(const std::string &message,
                                       const msg_meta &conf, int64_t reply_id)
 {
@@ -1992,26 +2080,37 @@ Json::Value gpt3_5::build_user_content(const std::string &message,
         if (it->position() > last) {
             segs.push_back({false, message.substr(last, it->position() - last)});
         }
-        segs.push_back({true, cq_image_url(it->str())});
+        std::string url = cq_image_url(it->str());
+        segs.push_back({true, url});
         last = it->position() + it->length();
     }
     if (last < message.size()) {
         segs.push_back({false, message.substr(last)});
     }
 
-    // 被引用消息里的图：常见用法是「回复这张图问问题」
+    // 被引用消息里的图：常见用法是「回复这张图问问题」。
+    // 如果被引用的是合并转发，图藏在转发内容里，要单独展开。
+    std::vector<std::string> quoted_images;
+    std::vector<std::string> forward_urls;
     if (reply_id != -1) {
         try {
             Json::Value param;
             param["message_id"] = reply_id;
             Json::Value info =
                 string_to_json(conf.p->cq_send("get_msg", param));
-            if (info["retcode"].asInt() == 0 && info["data"].isMember("message")) {
-                std::string quoted = messageArr_to_string(info["data"]["message"]);
+            if (info["retcode"].asInt() == 0 &&
+                info["data"].isMember("message")) {
+                const Json::Value &quoted_msg = info["data"]["message"];
+                collect_images_from_message(quoted_msg, quoted_images);
+
+                // 引用的消息本身是转发：展开里面的图
+                std::string quoted = messageArr_to_string(quoted_msg);
+                static const std::regex fwd_re(R"(\[CQ:forward,id=([^,\]]+))");
                 for (auto it = std::sregex_iterator(quoted.begin(), quoted.end(),
-                                                    cq_image_re);
+                                                    fwd_re);
                      it != std::sregex_iterator(); ++it) {
-                    segs.push_back({true, cq_image_url(it->str())});
+                    collect_forward_images(conf.p, (*it)[1].str(), forward_urls,
+                                           0);
                 }
             }
         }
@@ -2019,11 +2118,29 @@ Json::Value gpt3_5::build_user_content(const std::string &message,
         }
     }
 
-    bool has_image = std::any_of(segs.begin(), segs.end(),
-                                 [](const Segment &s) { return s.is_image; });
-    if (!has_image) return Json::Value(); // 纯文本：沿用旧格式
+    // 当前消息本身就是合并转发：展开里面的图。
+    // 这些图不在 message 文本里（文本里只有 [CQ:forward,id=...]），
+    // 所以不会和 segs 重复。
+    {
+        static const std::regex fwd_re(R"(\[CQ:forward,id=([^,\]]+))");
+        for (auto it = std::sregex_iterator(message.begin(), message.end(),
+                                            fwd_re);
+             it != std::sregex_iterator(); ++it) {
+            collect_forward_images(conf.p, (*it)[1].str(), forward_urls, 0);
+        }
+    }
+
+    // 当前消息里有没有直接贴的图（不是转发里的）
+    const bool has_inline_image =
+        std::any_of(segs.begin(), segs.end(),
+                    [](const Segment &s) { return s.is_image; });
+
+    if (!has_inline_image && quoted_images.empty() && forward_urls.empty()) {
+        return Json::Value(); // 纯文本：沿用旧格式
+    }
 
     Json::Value content(Json::arrayValue);
+    // segs 里的图就是"当前消息 + 被引用消息"里直接贴的图
     for (const auto &s : segs) {
         if (s.is_image) {
             Json::Value part = store_image(s.text, conf);
@@ -2039,6 +2156,34 @@ Json::Value gpt3_5::build_user_content(const std::string &message,
             content.append(part);
         }
     }
+
+    // 被引用消息里直接贴的图（不是转发里的）
+    if (!quoted_images.empty()) {
+        Json::Value note;
+        note["type"] = "text";
+        note["text"] = "（以下是引用消息里的图片）";
+        content.append(note);
+        for (const auto &url : quoted_images) {
+            Json::Value part = store_image(url, conf);
+            if (part.isNull()) continue;
+            content.append(part);
+        }
+    }
+
+    // forward_urls 才是"合并转发记录里"的图，单独追加并加说明，
+    // 让模型知道这些图来自转发的聊天记录，不是当前消息。
+    if (!forward_urls.empty()) {
+        Json::Value note;
+        note["type"] = "text";
+        note["text"] = "（以下图片来自合并转发的聊天记录）";
+        content.append(note);
+        for (const auto &url : forward_urls) {
+            Json::Value part = store_image(url, conf);
+            if (part.isNull()) continue;
+            content.append(part);
+        }
+    }
+
     if (content.empty()) return Json::Value();
     return content;
 }

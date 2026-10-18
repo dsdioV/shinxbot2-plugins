@@ -96,6 +96,13 @@ private:
     /// 纯文本时返回 null（调用方按旧格式存字符串，保证向后兼容）。
     Json::Value build_user_content(const std::string &message,
                                    const msg_meta &conf, int64_t reply_id);
+    /// 收集合并转发里的图片 URL（递归展开，带深度上限）。
+    /// 转到的是展开后的文本里那些 [图片] 占位符对应的真实图片。
+    void collect_forward_images(const bot *p, const std::string &forward_id,
+                                std::vector<std::string> &urls, int depth);
+    /// 从一条消息的 message 数组里抽出图片 URL。
+    void collect_images_from_message(const Json::Value &msg,
+                                     std::vector<std::string> &urls);
     /// 内部 part（含 image_ref）→ OpenAI content 数组（图片展开成 data URI）。
     Json::Value expand_content_for_api(const Json::Value &content);
     /// 取纯文本视图：图片降级成 "[图片]"（压缩/摘要用）。
