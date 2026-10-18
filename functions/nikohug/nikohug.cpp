@@ -6,6 +6,7 @@
 #include <Magick++.h>
 #include <fmt/core.h>
 
+#include <chrono>
 #include <exception>
 #include <fstream>
 #include <string>
@@ -224,10 +225,21 @@ void nikohug::process(std::string message, const msg_meta &conf)
     const std::string avatar_path = stem + "_avatar.png";
     const std::string out_png = stem + ".png";
 
+    auto t0 = std::chrono::steady_clock::now();
+    auto ms_since = [&t0]() {
+        return std::chrono::duration_cast<std::chrono::milliseconds>(
+                   std::chrono::steady_clock::now() - t0)
+            .count();
+    };
+
     try {
         download(fmt::format(kAvatarUrlTemplate, target), download_dir,
                  "nikohug_" + std::to_string(target) + "_avatar.png");
+        const auto t_dl = ms_since();
         compose(avatar_path, o1, o2, out_png);
+        conf.p->setlog(LOG::INFO,
+                       fmt::format("nikohug timing: download={}ms compose={}ms",
+                                   t_dl, ms_since() - t_dl));
     }
     catch (const std::exception &e) {
         conf.p->setlog(LOG::ERROR, std::string("nikohug: ") + e.what());
@@ -237,9 +249,13 @@ void nikohug::process(std::string message, const msg_meta &conf)
         return;
     }
 
+    const auto t_send_begin = ms_since();
     conf.p->cq_send(fmt::format("[CQ:image,file=file://{},id=40000]",
                                 fs::absolute(fs::path(out_png)).string()),
                     conf);
+    conf.p->setlog(LOG::INFO,
+                   fmt::format("nikohug timing: send_call={}ms total_before_send={}ms",
+                               ms_since() - t_send_begin, t_send_begin));
     conf.p->setlog(LOG::INFO,
                    fmt::format("nikohug at g{} by {} -> {}", conf.group_id,
                                conf.user_id, target));
