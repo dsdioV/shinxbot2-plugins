@@ -239,6 +239,17 @@ void img_fun::process(std::string message, const msg_meta &conf)
                 [&](float delta_p) { p.setProgress(prog += delta_p * 0.7); });
         }
         p.setBar(0.9, "图片处理完成，保存中");
+        // GIF 体积几乎只由画布尺寸决定（实测 1000px/12 帧 2.3MB、
+        // 350px/12 帧 435KB），而 QQ 首次上传耗时与体积近似线性：
+        // 2.3MB 约 19s、435KB 约 7s。写出前把长边限制到 kGifMaxEdge，
+        // 可显著缩短发送等待，同时保持动图可播放。
+        constexpr size_t kGifMaxEdge = 400;
+        for (auto &im : img_list) {
+            if (im.columns() > kGifMaxEdge || im.rows() > kGifMaxEdge) {
+                im.resize(Magick::Geometry(kGifMaxEdge, kGifMaxEdge));
+                im.page(Magick::Geometry(0, 0, 0, 0));
+            }
+        }
         Magick::writeImages(img_list.begin(), img_list.end(),
                             download_dir + "/" + filename);
         p.setBar(0.9, "图片处理完成，发送中");
