@@ -203,6 +203,17 @@ void img_fun::process(std::string message, const msg_meta &conf)
         mgif) {
         std::vector<Magick::Image> img_list;
         Magick::readImages(&img_list, filepath);
+        // 处理前先限尺寸。kaleido 对每帧再做 sectors 次全尺寸拷贝+旋转，
+        // 内存峰值随「帧数 x 输入边长^2」增长：实测 12 帧 GIF 在 1080px
+        // 时峰值 532MB、600px 时 308MB，而容器上限只有 1GB。
+        // 超限会被内核 OOMKilled 导致 bot 重启，所以必须在入口处收窄。
+        constexpr size_t kProcMaxEdge = 640;
+        for (auto &im : img_list) {
+            if (im.columns() > kProcMaxEdge || im.rows() > kProcMaxEdge) {
+                im.resize(Magick::Geometry(kProcMaxEdge, kProcMaxEdge));
+                im.page(Magick::Geometry(0, 0, 0, 0));
+            }
+        }
         if (proc_type.type == img_fun_type::MIRROR) {
             filename += "_mir.gif";
             float prog = 0.2;
@@ -266,6 +277,17 @@ void img_fun::process(std::string message, const msg_meta &conf)
                 p.setProgress(prog += delta_p * 0.7);
             });
         }
+        // 静态分支同样限制尺寸，并压成 8-bit 调色板：
+        // 历史产物里出现过 1.4MB 的 _mir.png（上传需 10s+）。
+        constexpr size_t kStaticMaxEdge = 640;
+        if (img.columns() > kStaticMaxEdge || img.rows() > kStaticMaxEdge) {
+            img.resize(Magick::Geometry(kStaticMaxEdge, kStaticMaxEdge));
+            img.page(Magick::Geometry(0, 0, 0, 0));
+        }
+        img.strip();
+        img.defineValue("png:compression-level", "9");
+        img.defineValue("png:format", "png8");
+        img.magick("PNG8");
         img.write(download_dir + "/" + filename);
         p.setBar(0.9, "图片处理完成，发送中");
     }
