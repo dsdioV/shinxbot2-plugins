@@ -2147,6 +2147,14 @@ Json::Value gpt3_5::build_user_content(const std::string &message,
             param["message_id"] = reply_id;
             Json::Value info =
                 string_to_json(conf.p->cq_send("get_msg", param));
+            // 诊断：被引用消息的原始结构（转发/图片都靠它判断）
+            conf.p->setlog(
+                LOG::INFO,
+                "openai: quoted reply_id=" + std::to_string(reply_id) +
+                    " retcode=" + std::to_string(info["retcode"].asInt()) +
+                    " body=" +
+                    Json::writeString(Json::StreamWriterBuilder(), info)
+                        .substr(0, 600));
             if (info["retcode"].asInt() == 0 &&
                 info["data"].isMember("message")) {
                 const Json::Value &quoted_msg = info["data"]["message"];
