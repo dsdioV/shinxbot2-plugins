@@ -54,6 +54,9 @@ private:
     std::string expand_forward_content(const bot *p, const std::string &forward_id,
                                        int depth, forward_budget &budget);
     std::string get_cached_nickname(const msg_meta &conf);
+    /// 诊断：把请求体按来源拆开算体积，用于定位 413 的成因
+    std::string describe_request_size(const Json::Value &request,
+                                      int tool_round, int retry_no);
     std::string get_short_time();
     std::string simplify_cq_codes(const std::string &message, userid_t botqq = 0);
     std::string strip_bot_at(const std::string &message, const msg_meta &conf);

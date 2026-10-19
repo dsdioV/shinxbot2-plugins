@@ -2664,6 +2664,75 @@ bool gpt3_5::is_malformed_tool_response(const Json::Value &resp)
     return !has_calls && !has_text;
 }
 
+/// 把 chat/completions 请求体拆开算体积，用于诊断 413。
+///
+/// 背景：上游在请求体很大时会回 413 (Payload Too Large)。实测 15~34MB
+/// 都出现过，且同样的 34MB 有时成功有时失败，属于边界性拒绝。要判断该
+/// 砍什么，必须先知道体积花在哪儿，所以这里按 role 分类统计：
+///   - system / user / assistant 的文本
+///   - 图片（image_url 的 data URI，base64 后通常最占地方）
+///   - 工具结果（role=tool，web_search 的返回会堆在这里）
+///   - tools 定义本身
+std::string gpt3_5::describe_request_size(const Json::Value &request,
+                                          int tool_round, int retry_no)
+{
+    auto jlen = [](const Json::Value &v) {
+        if (v.isString()) return v.asString().size();
+        if (v.isNull()) return size_t(0);
+        Json::StreamWriterBuilder wb;
+        wb["indentation"] = "";
+        wb["emitUTF8"] = true;
+        return Json::writeString(wb, v).size();
+    };
+
+    size_t total = jlen(request);
+    size_t n_system = 0, n_user = 0, n_assistant = 0, n_tool = 0;
+    size_t n_image = 0, n_tools_def = 0;
+    int c_image = 0, c_msgs = 0;
+
+    const Json::Value &msgs = request["messages"];
+    if (msgs.isArray()) {
+        c_msgs = static_cast<int>(msgs.size());
+        for (const auto &m : msgs) {
+            const std::string role = m.get("role", "").asString();
+            const Json::Value &content = m["content"];
+            size_t sz = jlen(content);
+
+            if (content.isArray()) {
+                for (const auto &part : content) {
+                    if (part.get("type", "").asString() == "image_url") {
+                        n_image += jlen(part);
+                        ++c_image;
+                    }
+                }
+            }
+            if (role == "system") n_system += sz;
+            else if (role == "user") n_user += sz;
+            else if (role == "assistant") n_assistant += sz;
+            else if (role == "tool") n_tool += sz;
+        }
+    }
+    n_tools_def = jlen(request["tools"]);
+
+    // 统一用 MB 显示，方便直接和上游的限制对照
+    auto mb = [](size_t n) {
+        char buf[32];
+        snprintf(buf, sizeof(buf), "%.2fMB", n / 1024.0 / 1024.0);
+        return std::string(buf);
+    };
+
+    return "openai: 请求体积 total=" + mb(total) +
+           " system=" + mb(n_system) +
+           " user=" + mb(n_user) +
+           " assistant=" + mb(n_assistant) +
+           " tool=" + mb(n_tool) +
+           " image=" + mb(n_image) + "(" + std::to_string(c_image) + "张)" +
+           " tools_def=" + mb(n_tools_def) +
+           " msgs=" + std::to_string(c_msgs) +
+           " rounds=" + std::to_string(tool_round) +
+           " retry=" + std::to_string(retry_no);
+}
+
 Json::Value gpt3_5::run_chat_with_tools(Json::Value request, size_t keyid,
                                        const msg_meta &conf)
 {
@@ -2705,6 +2774,15 @@ Json::Value gpt3_5::run_chat_with_tools(Json::Value request, size_t keyid,
     while (true) {
         try {
             request["model"] = cur_model;
+            // 诊断：请求体到底有多大、哪部分在膨胀。
+            // 上游 Gemini 在 15~34MB 这个量级会边界性地回 413
+            // （同一个 34MB 有时 200 有时 413），所以必须知道体积构成，
+            // 否则无从判断该砍历史、砍图还是砍工具结果。
+            if (rounds == 0 && empty_retries == 0) {
+                conf.p->setlog(LOG::INFO,
+                               describe_request_size(request, rounds,
+                                                    empty_retries));
+            }
             const std::string raw = do_post(
                 cur_base, "/v1/chat/completions", false, request,
                 {{"Content-Type", "application/json"},
