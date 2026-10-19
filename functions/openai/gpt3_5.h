@@ -75,7 +75,19 @@ private:
     // {"type":"image_ref","file":"<sha256>.jpg","mime":"image/jpeg"}；
     // 真正请求 API 时才展开成 data URI。
     bool media_enabled = true;
-    int media_max_edge = 2048;
+    // 图片入库时统一压到这个长边。实测（服务器上真实素材）：
+    //   原图最大 2048px / 1.58MB，多数 89KB 左右（p50），体积被少数
+    //   巨型图拉起来。压到 1568px + q82 后最大单张降到 362KB，
+    //   而 1568px 对模型的视觉识别完全够用（OpenAI/Anthropic 的推荐
+    //   长边都在 1024~1568 区间）。再往下压到 1024px 收益不明显，
+    //   但细节损失开始可见。
+    int media_max_edge = 1568;
+    int media_quality = 82;
+    // 单个请求里，所有历史图片展开成 base64 后的总预算。
+    // 超过就按"从旧到新"降级成 [图片] 占位符。为什么需要它：
+    // 上游在请求体 15~34MB 时会边界性回 413，实测 34MB 有时成功有时
+    // 失败；而 430 张图全展开是 60MB+。按体积裁剪比按轮数直观。
+    double media_budget_mb = 8.0;
 
     // ── 工具调用（web search）──────────────────────────────────────
     // 走 OpenAI 原生 tools / tool_calls，不是"猜关键词再搜"的固定流程。
@@ -123,7 +135,12 @@ private:
     void collect_images_from_message(const Json::Value &msg,
                                      std::vector<std::string> &urls);
     /// 内部 part（含 image_ref）→ OpenAI content 数组（图片展开成 data URI）。
-    Json::Value expand_content_for_api(const Json::Value &content);
+    /// budget 是共享的字节预算：调用方从旧到新遍历历史时必须传同一个，
+    /// 超预算的图会降级成 [图片] 占位符。传 nullptr 表示不限制。
+    Json::Value expand_content_for_api(const Json::Value &content,
+                                       size_t *budget = nullptr);
+    /// 把一条消息里的 image_ref 全部降级成 [图片] 文本（用于体积裁剪）。
+    Json::Value degrade_images(const Json::Value &content);
     /// 取纯文本视图：图片降级成 "[图片]"（压缩/摘要用）。
     std::string content_to_text(const Json::Value &content);
     bool try_acquire_session(int64_t id, size_t keyid, const msg_meta &conf,

@@ -1566,16 +1566,62 @@ void gpt3_5::process(std::string message, const msg_meta &conf)
 
         Json::Value K = mode_prompt[pre_default[id]];
         Json::ArrayIndex sz = h.size();
+
+        // 图片体积预算：**从新到旧**分配。
+        // 上游在请求体 15~34MB 时会边界性回 413，而历史里几十轮前的
+        // 图片每轮都要重新 base64 展开，是体积的主要来源。这里给所有
+        // 历史图片一个总额度（media_budget_mb），最新的优先拿，
+        // 拿不到的降级成 [图片]。按体积而不是按轮数：图片大小差异
+        // 极大（实测 3KB~1.6MB），按轮数要么砍太多要么还是超。
+        size_t media_budget = static_cast<size_t>(media_budget_mb * 1024 * 1024);
+
+        // 先算出每条消息展开后的图片占用，从最新往前标记哪些能留。
+        // 正向遍历历史但配额从尾部（最新）开始扣。
+        std::vector<bool> keep_image(sz, false);
+        for (Json::ArrayIndex idx = sz; idx > 0; --idx) {
+            const Json::Value &entry = h[idx - 1];
+            const Json::Value &content = entry["content"];
+            if (!content.isArray()) continue;
+            bool ok = true;
+            size_t need = 0;
+            for (const auto &part : content) {
+                if (part.get("type", "").asString() != "image_ref") continue;
+                const std::string file = part.get("file", "").asString();
+                fs::path p = fs::path(media_dir()) / file;
+                std::error_code ec;
+                auto fsz = fs::file_size(p, ec);
+                if (ec) continue;
+                need += fsz / 3 * 4 + 8; // base64 后约 1.34 倍
+            }
+            if (need == 0) continue;
+            if (need <= media_budget) {
+                media_budget -= need;
+                keep_image[idx - 1] = true;
+            }
+            else {
+                ok = false;
+            }
+            (void)ok;
+        }
+
         for (Json::ArrayIndex i = 0; i < sz; i++) {
             Json::Value entry = h[i];
             // 历史里存的是 image_ref 引用，发给 API 前才展开成 data URI。
             // 这样磁盘上的历史永远不含图片字节。
             if (entry["content"].isArray()) {
-                entry["content"] = expand_content_for_api(entry["content"]);
+                if (keep_image[i]) {
+                    entry["content"] =
+                        expand_content_for_api(entry["content"]);
+                }
+                else {
+                    // 超出图片预算：保留"这里有张图"的语义，但不占体积
+                    entry["content"] = degrade_images(entry["content"]);
+                }
             }
             K.append(entry);
         }
         if (user_input_J["content"].isArray()) {
+            // 当轮新发的图一定保留：用户刚发的图模型必须看到
             user_input_J["content"] =
                 expand_content_for_api(user_input_J["content"]);
         }
@@ -2118,7 +2164,28 @@ Json::Value gpt3_5::store_image(const std::string &url,
 
         Magick::Blob blob;
         img.magick("JPEG");
+        img.strip();                             // 去掉 EXIF/ICC，省几 KB
+        img.quality(media_quality);              // 默认是 92，太大
         img.write(&blob);
+
+        // 分辨率已经限住了，但同样 1568px 的图体积仍可能差 10 倍
+        // （实测 90KB ~ 362KB）。这里再按字节数兜一次底：
+        // 超过 media_max_bytes 就逐级降质量重压，直到进线或到底线。
+        static const size_t media_max_bytes = 400 * 1024;
+        static const int quality_floor = 55;
+        int q = media_quality;
+        while (blob.length() > media_max_bytes && q > quality_floor) {
+            q -= 10;
+            Magick::Blob smaller;
+            img.quality(q);
+            img.write(&smaller);
+            blob = smaller;
+        }
+        conf.p->setlog(
+            LOG::INFO,
+            "openai: image stored " + std::to_string(blob.length() / 1024) +
+                "KB (" + std::to_string(img.columns()) + "x" +
+                std::to_string(img.rows()) + " q" + std::to_string(q) + ")");
 
         std::string bytes(static_cast<const char *>(blob.data()), blob.length());
         if (bytes.size() < 64) {
@@ -2468,7 +2535,8 @@ Json::Value gpt3_5::build_user_content(const std::string &message,
     return content;
 }
 
-Json::Value gpt3_5::expand_content_for_api(const Json::Value &content)
+Json::Value gpt3_5::expand_content_for_api(const Json::Value &content,
+                                            size_t *budget)
 {
     if (content.isString()) return content;
     if (!content.isArray()) return content;
@@ -2501,11 +2569,47 @@ Json::Value gpt3_5::expand_content_for_api(const Json::Value &content)
             out.append(fallback);
             continue;
         }
+
+        // base64 后体积约 1.34 倍。超预算就降级成占位符：
+        // 上游在请求体 15MB+ 时会 413，而看着无关的旧图全靠体积
+        // 拖累请求体，模型也不会去回看几十轮前的图片。
+        const size_t encoded_size = bytes.size() / 3 * 4 + 8;
+        if (budget != nullptr) {
+            if (encoded_size > *budget) {
+                Json::Value fallback;
+                fallback["type"] = "text";
+                fallback["text"] = "[图片]";
+                out.append(fallback);
+                continue;
+            }
+            *budget -= encoded_size;
+        }
+
         Json::Value img;
         img["type"] = "image_url";
         img["image_url"]["url"] =
             "data:" + mime + ";base64," + b64_encode(bytes);
         out.append(img);
+    }
+    return out;
+}
+
+/// 把 content 数组里的 image_ref 全部换成 [图片] 文本。
+/// 用于超预算裁剪：保留"这里曾经有张图"的语义，但不占体积。
+Json::Value gpt3_5::degrade_images(const Json::Value &content)
+{
+    if (!content.isArray()) return content;
+    Json::Value out(Json::arrayValue);
+    for (const auto &part : content) {
+        if (part.get("type", "").asString() == "image_ref") {
+            Json::Value fallback;
+            fallback["type"] = "text";
+            fallback["text"] = "[图片]";
+            out.append(fallback);
+        }
+        else {
+            out.append(part);
+        }
     }
     return out;
 }
