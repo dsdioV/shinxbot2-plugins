@@ -20,6 +20,74 @@ namespace fs = std::filesystem;
 
 namespace {
 
+/// 把可能混进来的 SSE（"data: {...}\ndata: [DONE]"）解析成 JSON。
+///
+/// 为什么需要：中转（new-api）在上游超时时会把上游的**流式原文**直接透传，
+/// 即使请求是 stream=false。实测响应体是：
+///     data: {"id":"",...,"choices":[],"usage":{...,"prompt_tokens":0,...}}
+///     data: [DONE]
+/// 这种文本直接丢给 Json::Reader 会失败，返回空 Value，上层就把
+/// "解析失败" 误报成 "缺少 choices"。这里先尝试整体解析，失败则按行
+/// 抽出所有 data: 负载，取最后一个带 choices 的 JSON 对象。
+/// 解析不出来时返回空 Value（isNull()），让调用方走 err 路径。
+Json::Value parse_api_response(const std::string &raw)
+{
+    if (raw.empty()) return Json::Value();
+
+    // 正常情况：整段就是 JSON
+    {
+        Json::Value root;
+        Json::Reader re;
+        if (re.parse(raw, root)) return root;
+    }
+
+    // SSE：逐行取 "data:" 负载
+    Json::Value last_with_choices;
+    size_t pos = 0;
+    bool saw_any = false;
+    while (pos < raw.size()) {
+        size_t eol = raw.find('\n', pos);
+        if (eol == std::string::npos) eol = raw.size();
+        std::string line = raw.substr(pos, eol - pos);
+        pos = eol + 1;
+
+        // 去掉行尾 \r
+        while (!line.empty() && (line.back() == '\r' || line.back() == ' '))
+            line.pop_back();
+
+        const std::string prefix = "data:";
+        if (line.size() < prefix.size() ||
+            line.compare(0, prefix.size(), prefix) != 0) {
+            continue;
+        }
+        std::string payload = line.substr(prefix.size());
+        while (!payload.empty() && payload.front() == ' ') payload.erase(0, 1);
+        if (payload.empty() || payload == "[DONE]") continue;
+
+        Json::Value chunk;
+        Json::Reader re;
+        if (!re.parse(payload, chunk)) continue;
+        saw_any = true;
+        if (chunk.isMember("choices") && chunk["choices"].isArray() &&
+            !chunk["choices"].empty()) {
+            last_with_choices = chunk;
+        }
+        else if (last_with_choices.isNull() && chunk.isMember("choices")) {
+            // 只有空 choices 的收尾块：留着，好让上层能看出 tokens 用量
+            last_with_choices = chunk;
+        }
+    }
+
+    if (!last_with_choices.isNull()) return last_with_choices;
+    // 流里一条可用的都没有：交给上层当格式异常处理，但要带上线索
+    if (saw_any) {
+        Json::Value v;
+        v["__sse_empty__"] = true;
+        return v;
+    }
+    return Json::Value();
+}
+
 /// 标准 base64 编码。自己实现是为了不引入额外依赖：
 /// 插件仓的 lib/base64 是空 submodule，而 httplib 里那个在 detail 命名空间。
 std::string b64_encode(const std::string &in)
@@ -589,11 +657,11 @@ bool gpt3_5::compress_history(int64_t id, size_t keyid, const msg_meta &conf,
 
     Json::Value resp;
     try {
-        resp = string_to_json(do_post(base_url, "/v1/chat/completions", false,
-                                      req,
-                                      {{"Content-Type", "application/json"},
-                                       {"Authorization", "Bearer " + key[keyid]}},
-                                      true));
+        resp = parse_api_response(
+            do_post(base_url, "/v1/chat/completions", false, req,
+                    {{"Content-Type", "application/json"},
+                     {"Authorization", "Bearer " + key[keyid]}},
+                    true));
     }
     catch (std::string e) {
         if (error_message) *error_message = e;
@@ -1546,6 +1614,12 @@ void gpt3_5::process(std::string message, const msg_meta &conf)
     else {
         if (!J.isMember("choices") || !J["choices"].isArray() ||
             J["choices"].empty()) {
+            // 把实际收到的东西记下来，否则下次又只能看到一句笼统的
+            // "缺少 choices"，无从判断是超时、鉴权还是中转抽风。
+            conf.p->setlog(
+                LOG::WARNING,
+                "openai: 响应缺少 choices，原始内容前 400 字节=" +
+                    J.toStyledString().substr(0, 400));
             conf.p->cq_send("Openai ERROR: API 响应格式异常(缺少 choices)",
                             conf);
             return;
@@ -2611,11 +2685,28 @@ Json::Value gpt3_5::run_chat_with_tools(Json::Value request, size_t keyid,
     while (true) {
         try {
             request["model"] = cur_model;
-            resp = string_to_json(do_post(
+            const std::string raw = do_post(
                 cur_base, "/v1/chat/completions", false, request,
                 {{"Content-Type", "application/json"},
                  {"Authorization", "Bearer " + cur_key}},
-                true));
+                true);
+            resp = parse_api_response(raw);
+            // 中转把上游流式原文透传过来（通常是上游超时返回空流）：
+            // 这既不是正常响应也不是明确报错，给出可理解的原因，
+            // 而不是让它掉进"缺少 choices"那个笼统分支。
+            if (resp.isNull() ||
+                (resp.isObject() && resp.isMember("__sse_empty__"))) {
+                Json::Value err;
+                err["error"]["message"] =
+                    "上游返回了空响应（多为模型超时或中转中断），请稍后重试。";
+                return err;
+            }
+            if (!resp.isMember("choices") && !resp.isMember("error")) {
+                Json::Value err;
+                err["error"]["message"] =
+                    "上游响应不是有效的 chat.completion。";
+                return err;
+            }
         }
         catch (const std::string &e) {
             Json::Value err;
