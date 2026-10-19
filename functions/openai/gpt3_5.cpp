@@ -13,6 +13,7 @@
 #include <ctime>
 #include <cstring>
 #include <chrono>
+#include <thread>
 #include <algorithm>
 #include <cctype>
 
@@ -2682,6 +2683,25 @@ Json::Value gpt3_5::run_chat_with_tools(Json::Value request, size_t keyid,
 
     Json::Value resp;
     int rounds = 0;
+    // 上游偶发返回空流（中转超时后透传 "choices":[] 的收尾块）。
+    // 这种是瞬时的，重试往往立刻就好，不该把错误抛给用户。
+    int empty_retries = 0;
+    static const int kMaxEmptyRetries = 2;
+
+    // 判断"上游给了个空壳"：choices 为空数组，且 usage 里一个 token 都没算。
+    // 注意不能用 "choices 为空" 单独判定 —— 工具轮次里也可能出现空 choices，
+    // 那种情况有 token 用量，不能当失败。
+    auto looks_like_empty_upstream = [](const Json::Value &r) {
+        if (!r.isObject()) return false;
+        if (!r.isMember("choices") || !r["choices"].isArray()) return false;
+        if (!r["choices"].empty()) return false;
+        const Json::Value &u = r["usage"];
+        if (!u.isObject()) return true; // 连 usage 都没有，八成是空壳
+        const int64_t prompt = u.get("prompt_tokens", 0).asInt64();
+        const int64_t completion = u.get("completion_tokens", 0).asInt64();
+        return prompt == 0 && completion == 0;
+    };
+
     while (true) {
         try {
             request["model"] = cur_model;
@@ -2695,10 +2715,22 @@ Json::Value gpt3_5::run_chat_with_tools(Json::Value request, size_t keyid,
             // 这既不是正常响应也不是明确报错，给出可理解的原因，
             // 而不是让它掉进"缺少 choices"那个笼统分支。
             if (resp.isNull() ||
-                (resp.isObject() && resp.isMember("__sse_empty__"))) {
+                (resp.isObject() && resp.isMember("__sse_empty__")) ||
+                looks_like_empty_upstream(resp)) {
+                if (empty_retries < kMaxEmptyRetries) {
+                    ++empty_retries;
+                    conf.p->setlog(
+                        LOG::WARNING,
+                        "openai: 上游返回空响应，第 " +
+                            std::to_string(empty_retries) + " 次重试");
+                    std::this_thread::sleep_for(
+                        std::chrono::milliseconds(800 * empty_retries));
+                    continue;
+                }
                 Json::Value err;
                 err["error"]["message"] =
-                    "上游返回了空响应（多为模型超时或中转中断），请稍后重试。";
+                    "上游连续返回空响应（模型超时或中转中断），已重试 "
+                    + std::to_string(kMaxEmptyRetries) + " 次。";
                 return err;
             }
             if (!resp.isMember("choices") && !resp.isMember("error")) {
