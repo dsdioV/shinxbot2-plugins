@@ -3,3 +3,4 @@ lib/events
 *.out
 *test*
 /.vscode
+/.diag

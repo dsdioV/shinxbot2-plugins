@@ -36,7 +36,23 @@ private:
     bool active_context_show_time = true;
     bool active_context_show_user_id = true;
     std::string get_quoted_content(const bot *p, int64_t reply_id, int depth = 0);
-    std::string expand_forward_content(const bot *p, const std::string &forward_id, int depth);
+
+    // 合并转发展开的预算与去重。
+    //
+    // QQ 端限定最多 4 层嵌套，所以「无限递归」并不成立；真正的杀手是
+    // **每层节点数上百 + 逐节点同步 HTTP**：调用次数按层数指数增长
+    // （实测 2 → 200 → 2万 → 200万），每次又是 get_forward_msg 的同步
+    // 往返 + 几十 KB JSON 解析 + 大字符串拼接，几秒内就能把进程打死。
+    // 因此只限制层数拦不住，必须同时限制：层数、重复 id、节点总数、字节数。
+    struct forward_budget {
+        std::set<std::string> visited; // 已展开的转发 id，兼作循环检测
+        int nodes = 0;                 // 已计入的节点数
+        size_t bytes = 0;              // 已展开文本的累计字节数
+    };
+    std::string expand_forward_content(const bot *p, const std::string &forward_id,
+                                       int depth);
+    std::string expand_forward_content(const bot *p, const std::string &forward_id,
+                                       int depth, forward_budget &budget);
     std::string get_cached_nickname(const msg_meta &conf);
     std::string get_short_time();
     std::string simplify_cq_codes(const std::string &message, userid_t botqq = 0);

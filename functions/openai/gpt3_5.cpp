@@ -1,4 +1,5 @@
 #include "gpt3_5.h"
+#include "cqscan.h"
 #include "utils.h"
 
 #include <Magick++.h>
@@ -687,16 +688,19 @@ std::string gpt3_5::get_short_time()
 
 std::string gpt3_5::simplify_cq_codes(const std::string &message, userid_t botqq)
 {
-    static const std::regex cq_regex(R"(\[CQ:([^,\]]+)([^\]]*)\])");
+    // 原来这里是 static const std::regex cq_regex(R"(\[CQ:([^,\]]+)([^\]]*)\])")。
+    // 这个模式在「不含 ',' 也不含 ']' 的超长连续段」上会让 libstdc++ 的
+    // 回溯执行器无限深递归、耗尽栈并 SIGSEGV（实测 28KB 即可打死 8MB 栈，
+    // 合并转发内联展开很容易到几十 KB）。改用线性扫描，无回溯、常数栈。
+    const std::vector<cqscan::Segment> segs = cqscan::split(message);
     std::string result;
-    auto begin = std::sregex_iterator(message.begin(), message.end(), cq_regex);
-    auto end = std::sregex_iterator();
-    size_t last_pos = 0;
-    for (auto it = begin; it != end; ++it) {
-        std::smatch match = *it;
-        result += message.substr(last_pos, match.position() - last_pos);
-        std::string type = match[1].str();
-        std::string args = match[2].str();
+    for (const auto &seg : segs) {
+        if (!seg.is_cq) {
+            result += seg.text;
+            continue;
+        }
+        const std::string &type = seg.type;
+        const std::string &args = seg.args;
         if (type == "image") result += "[图片]";
         else if (type == "record") result += "[语音]";
         else if (type == "face") result += "[表情]";
@@ -706,15 +710,13 @@ std::string gpt3_5::simplify_cq_codes(const std::string &message, userid_t botqq
         else if (type == "at") {
             bool is_bot = false;
             if (botqq != 0) {
-                std::string needle = "qq=" + std::to_string(botqq);
+                const std::string needle = "qq=" + std::to_string(botqq);
                 is_bot = args.find(needle) != std::string::npos;
             }
             result += is_bot ? "[@BOT]" : "[@某人]";
         }
         else result += "[" + type + "]";
-        last_pos = match.position() + match.length();
     }
-    result += message.substr(last_pos);
     std::replace(result.begin(), result.end(), '\n', ' ');
     std::replace(result.begin(), result.end(), '\r', ' ');
     return trim(result);
@@ -858,7 +860,7 @@ std::string gpt3_5::get_quoted_content(const bot *p, int64_t reply_id, int depth
     if (fwd_pos != std::string::npos) {
         size_t id_start = fwd_pos + 15;
         size_t id_end = content.find_first_of(",]", id_start);
-        if (id_end != std::string::npos) {
+        if (id_end != std::string::npos && id_end > id_start) {
             std::string forward_id = content.substr(id_start, id_end - id_start);
             return expand_forward_content(p, forward_id, depth);
         }
@@ -867,49 +869,58 @@ std::string gpt3_5::get_quoted_content(const bot *p, int64_t reply_id, int depth
     // Check for forward message with raw content (JSON format)
     size_t fwd_cont_pos = content.find("[CQ:forward,content=");
     if (fwd_cont_pos != std::string::npos) {
+        // 这个分支处理的是 NapCat 把转发树**内联展开**进 CQ 码的情况：
+        //   [CQ:forward,content=&#91;{node},...,{node}&#93;]
+        // 注意 jsoncpp 的 getMemberNames() 按**字母序**输出，所以
+        // content 永远排在 id 前面 —— 上面按 "[CQ:forward,id=" 找永远
+        // 找不到，实际都会落到这里。内联展开可能非常大（实测单条转发
+        // 序列化后 160KB+），所以这里先做量级检查再解析。
         size_t cont_start = fwd_cont_pos + 20;
         size_t cont_end = content.find_last_of(']'); // Find the outermost CQ code closure
         if (cont_end != std::string::npos && cont_end > cont_start) {
-            std::string raw_json = content.substr(cont_start, cont_end - cont_start);
+            const size_t raw_len = cont_end - cont_start;
+            // 内联展开超过这个体量就不再尝试解析：既没意义（模型也读不完），
+            // 又能避免把巨大的畸形 JSON 丢给 jsoncpp 做无谓的深拷贝。
+            static const size_t kMaxInlineForwardBytes = 256 * 1024;
+            if (raw_len > kMaxInlineForwardBytes) {
+                return "[转发记录过大，已省略]";
+            }
+            std::string raw_json = content.substr(cont_start, raw_len);
             // Decode potential HTML entities (like &#91; for [)
-            raw_json = std::regex_replace(raw_json, std::regex("&#91;"), "[");
-            raw_json = std::regex_replace(raw_json, std::regex("&#93;"), "]");
-            raw_json = std::regex_replace(raw_json, std::regex("&#44;"), ",");
+            // 用线性替换，别再走 regex_replace（大输入下同样有风险）
+            raw_json = cqscan::replace_all(raw_json, "&#91;", "[");
+            raw_json = cqscan::replace_all(raw_json, "&#93;", "]");
+            raw_json = cqscan::replace_all(raw_json, "&#44;", ",");
             
             try {
                 Json::Value fwd_data = string_to_json(raw_json);
                 if (fwd_data.isArray()) {
-                    Json::Value mock_fwd;
-                    mock_fwd["retcode"] = 0;
-                    mock_fwd["data"]["messages"] = fwd_data;
-                    
-                    // We need a way to reuse the formatting logic in expand_forward_content
-                    // Since expand_forward_content currently fetches, we'll manually format here or refactor.
-                    // For now, let's process it directly to be safe.
+                    // 这里原来用
+                    //   static const std::regex cq_regex(R"(\[CQ:([^,\]]+)[^\]]*\])");
+                    // 对每个节点做 sregex_iterator —— **这正是线上 SIGSEGV 的现场**。
+                    // 内联展开的节点里含有几十 KB 不含 ',' / ']' 的连续段，
+                    // libstdc++ 回溯执行器会无限深递归把栈打爆。
+                    // 改成 cqscan::split 线性扫描。
                     std::string result = (depth == 0) ? "合并转发记录:" : "";
-                    static const std::regex cq_regex(R"(\[CQ:([^,\]]+)[^\]]*\])");
                     for (const auto &m : fwd_data) {
                         std::string msg_text = messageArr_to_string(m.isMember("message") ? m["message"] : m["content"]);
                         std::replace(msg_text.begin(), msg_text.end(), '\n', ' ');
                         std::replace(msg_text.begin(), msg_text.end(), '\r', ' ');
-                        
+
                         std::string cleaned;
-                        auto words_begin = std::sregex_iterator(msg_text.begin(), msg_text.end(), cq_regex);
-                        auto words_end = std::sregex_iterator();
-                        size_t last_pos = 0;
-                        for (std::sregex_iterator i = words_begin; i != words_end; ++i) {
-                            std::smatch match = *i;
-                            cleaned += msg_text.substr(last_pos, match.position() - last_pos);
-                            std::string type = match[1].str();
+                        for (const auto &seg : cqscan::split(msg_text)) {
+                            if (!seg.is_cq) {
+                                cleaned += seg.text;
+                                continue;
+                            }
+                            const std::string &type = seg.type;
                             if (type == "image") cleaned += "[图片]";
                             else if (type == "record") cleaned += "[语音]";
                             else if (type == "face") cleaned += "[表情]";
                             else if (type == "at") cleaned += "[@某人]";
                             else cleaned += "[" + type + "]";
-                            last_pos = match.position() + match.length();
                         }
-                        cleaned += msg_text.substr(last_pos);
-                        
+
                         std::string nick = m["sender"]["nickname"].asString();
                         uint64_t uid = m["sender"]["user_id"].asUInt64();
                         if (uid != 0) result += "[" + nick + "(" + std::to_string(uid) + ")]：" + cleaned;
@@ -940,6 +951,28 @@ std::string gpt3_5::get_quoted_content(const bot *p, int64_t reply_id, int depth
 
 std::string gpt3_5::expand_forward_content(const bot *p, const std::string &forward_id, int depth)
 {
+    forward_budget budget;
+    return expand_forward_content(p, forward_id, depth, budget);
+}
+
+std::string gpt3_5::expand_forward_content(const bot *p, const std::string &forward_id,
+                                           int depth, forward_budget &budget)
+{
+    // ── 展开预算 ──────────────────────────────────────────────────────
+    // QQ 只允许 4 层嵌套，但每层节点数可以上百，逐层展开的调用次数是
+    // 指数级的（2 → 200 → 2万 → 200万）。只卡层数没用，这里同时卡：
+    //   层数、重复 id、节点总数、累计字节数。
+    // 任一超限就停止继续展开，返回可读的截断说明，绝不让进程被拖死。
+    static const int kMaxDepth = 5;      // 层数（比 QQ 的 4 层略宽，留余量）
+    static const int kMaxNodes = 200;    // 整个展开过程计入的节点总数
+    static const size_t kMaxBytes = 8192; // 展开文本的累计字节上限
+
+    if (depth > kMaxDepth) return "[转发嵌套过深，已省略]";
+    if (budget.nodes >= kMaxNodes) return "[转发内容过多，已省略]";
+    if (budget.bytes >= kMaxBytes) return "[转发内容过长，已省略]";
+    // 同一个转发 id 只展开一次：既防循环引用，也避免重复请求
+    if (!budget.visited.insert(forward_id).second) return "";
+
     Json::Value get_fwd_param;
     get_fwd_param["id"] = forward_id;
     Json::Value fwd_info = string_to_json(
@@ -952,8 +985,11 @@ std::string gpt3_5::expand_forward_content(const bot *p, const std::string &forw
                                : fwd_info["data"];
     std::string result = (depth == 0) ? "合并转发记录:" : "";
     if (messages.isArray()) {
-        static const std::regex cq_regex(R"(\[CQ:([^,\]]+)[^\]]*\])");
         for (const auto &m : messages) {
+            if (budget.nodes >= kMaxNodes) {
+                result += "\n...[转发内容过多，已省略剩余部分]";
+                break;
+            }
             if (!m.isMember("message") && !m.isMember("content")) continue;
 
             std::string content = messageArr_to_string(
@@ -967,24 +1003,25 @@ std::string gpt3_5::expand_forward_content(const bot *p, const std::string &forw
                 if (id_end != std::string::npos) {
                     std::string nested_id =
                         content.substr(id_start, id_end - id_start);
-                    result += "\n" + expand_forward_content(p, nested_id, depth + 1);
+                    result += "\n" + expand_forward_content(p, nested_id, depth + 1, budget);
                     continue;
                 }
             }
 
+            ++budget.nodes;
             // Flatten newlines
             std::replace(content.begin(), content.end(), '\n', ' ');
             std::replace(content.begin(), content.end(), '\r', ' ');
 
-            // Simplify CQ codes
+            // Simplify CQ codes（线性扫描，不用 std::regex：
+            // 内联转发里的超长连续段会让回溯型执行器爆栈 SIGSEGV）
             std::string cleaned_content;
-            auto words_begin = std::sregex_iterator(content.begin(), content.end(), cq_regex);
-            auto words_end = std::sregex_iterator();
-            size_t last_pos = 0;
-            for (std::sregex_iterator i = words_begin; i != words_end; ++i) {
-                std::smatch match = *i;
-                cleaned_content += content.substr(last_pos, match.position() - last_pos);
-                std::string type = match[1].str();
+            for (const auto &seg : cqscan::split(content)) {
+                if (!seg.is_cq) {
+                    cleaned_content += seg.text;
+                    continue;
+                }
+                const std::string &type = seg.type;
                 if (type == "image") cleaned_content += "[图片]";
                 else if (type == "record") cleaned_content += "[语音]";
                 else if (type == "face") cleaned_content += "[表情]";
@@ -992,9 +1029,7 @@ std::string gpt3_5::expand_forward_content(const bot *p, const std::string &forw
                 else if (type == "at") cleaned_content += "[@某人]";
                 else if (type == "reply") cleaned_content += "[回复]";
                 else cleaned_content += "[" + type + "]";
-                last_pos = match.position() + match.length();
             }
-            cleaned_content += content.substr(last_pos);
             content = cleaned_content;
 
             if (!m.isMember("sender")) continue;
@@ -1008,6 +1043,12 @@ std::string gpt3_5::expand_forward_content(const bot *p, const std::string &forw
                 result += "[" + nick + "(" + std::to_string(uid) + ")]：" + content;
             } else {
                 result += "[" + nick + "]：" + content;
+            }
+
+            budget.bytes += result.size();
+            if (budget.bytes >= kMaxBytes) {
+                result += "\n...[转发内容过长，已省略剩余部分]";
+                break;
             }
         }
     }
@@ -1892,18 +1933,54 @@ static std::string cq_image_url(const std::string &segment)
     return cq_decode(segment.substr(pos, end - pos));
 }
 
+/// 读文件开头若干字节，用来嗅探图片格式。失败返回空串。
+static std::string read_binary_prefix(const std::string &path, size_t n)
+{
+    std::ifstream in(path, std::ios::binary);
+    if (!in) return "";
+    std::string buf(n, '\0');
+    in.read(&buf[0], static_cast<std::streamsize>(n));
+    buf.resize(static_cast<size_t>(in.gcount()));
+    return buf;
+}
+
+/// 按魔术字节判断图片格式，返回 ImageMagick 认识的格式名。
+///
+/// 为什么需要它：store_image 把图片先下载成临时文件，扩展名不可信；
+/// Magick::Image 只按扩展名选解码器，于是报
+///   "no decode delegate for this image format `TMP'"
+/// 这里直接看文件头，绕开扩展名。
+static std::string sniff_image_magick(const std::string &head)
+{
+    auto starts = [&head](const char *magic, size_t len) {
+        return head.size() >= len && head.compare(0, len, magic, len) == 0;
+    };
+    if (starts("\xFF\xD8\xFF", 3)) return "JPEG";
+    if (starts("\x89PNG\r\n\x1A\n", 8)) return "PNG";
+    if (starts("GIF87a", 6) || starts("GIF89a", 6)) return "GIF";
+    if (starts("BM", 2)) return "BMP";
+    if (head.size() >= 12 && starts("RIFF", 4) && head.compare(8, 4, "WEBP") == 0)
+        return "WEBP";
+    if (starts("II*\x00", 4) || starts("MM\x00*", 4)) return "TIFF";
+    return "";
+}
+
 Json::Value gpt3_5::store_image(const std::string &url,
                                 const msg_meta &conf)
 {
     if (url.empty()) return Json::Value();
 
     const std::string dir = media_dir();
-    // 临时名用 uuid，下载后再按内容命名，避免并发覆盖
+    // 临时名用 uuid，下载后再按内容命名，避免并发覆盖。
+    //
+    // 注意扩展名不能随便给：Magick::Image 靠**文件扩展名**选解码器，
+    // 用 .tmp 会直接失败（实测 "no decode delegate for this image format
+    // `TMP'"）。这里统一用 .img，再靠下面对文件头的嗅探判断真实格式。
     const std::string tmp_name = generate_uuid();
-    const fs::path tmp_path = fs::path(dir) / (tmp_name + ".tmp");
+    const fs::path tmp_path = fs::path(dir) / (tmp_name + ".img");
     try {
         fs::create_directories(dir);
-        download(url, dir, tmp_name + ".tmp");
+        download(url, dir, tmp_name + ".img");
     }
     catch (const std::exception &e) {
         conf.p->setlog(LOG::WARNING,
@@ -1933,7 +2010,25 @@ Json::Value gpt3_5::store_image(const std::string &url,
         // 入库时就压缩，避免历史里躺着 4000px 的原图。
         // 注意：Geometry::aspect(true) 在 resize() 里不等于"保持比例"，
         // 实测 4000x3000 会被拉成 2048x2048。这里自己算等比缩放。
-        Magick::Image img(tmp_path.string());
+        //
+        // 先按文件头嗅探真实格式：临时文件没有可信扩展名，直接构造
+        // Magick::Image(path) 会因"没有解码委托"而失败。这里显式把
+        // 魔术字节对应的格式塞进 magick()，让 ImageMagick 按内容解码。
+        Magick::Image img;
+        {
+            std::string head;
+            try {
+                head = read_binary_prefix(tmp_path.string(), 12);
+            }
+            catch (...) {
+                head.clear();
+            }
+            const std::string sniffed = sniff_image_magick(head);
+            if (!sniffed.empty()) {
+                img.magick(sniffed);
+            }
+        }
+        img.read(tmp_path.string());
         if (img.columns() > static_cast<size_t>(media_max_edge) ||
             img.rows() > static_cast<size_t>(media_max_edge)) {
             const double scale = std::min(
@@ -2041,18 +2136,33 @@ void gpt3_5::collect_images_from_message(const Json::Value &msg,
     // 字符串形态：CQ 码
     std::string s = msg.isString() ? msg.asString() : "";
     if (s.empty()) return;
-    static const std::regex cq_image_re(R"(\[CQ:image[^\]]*\])");
-    for (auto it = std::sregex_iterator(s.begin(), s.end(), cq_image_re);
-         it != std::sregex_iterator(); ++it) {
-        std::string url = cq_image_url(it->str());
-        if (!url.empty()) urls.push_back(url);
+    // 线性扫描代替 std::regex(R"(\[CQ:image[^\]]*\])")：后者的 [^\]]*
+    // 在超长连续段上会爆栈。
+    for (const auto &seg : cqscan::split(s)) {
+        if (!seg.is_cq || seg.type != "image") continue;
+        std::string url = cqscan::arg_value(seg.args, "url");
+        if (url.empty()) continue;
+        urls.push_back(cq_decode(url));
     }
 }
 
 void gpt3_5::collect_forward_images(bot *p, const std::string &forward_id,
                                     std::vector<std::string> &urls, int depth)
 {
+    // 和文本展开共用同一套预算口径：QQ 虽然只允许 4 层嵌套，但每层节点
+    // 数可达上百，逐层递归会让 get_forward_msg 的请求数指数增长。这里同样
+    // 用 visited 去重 + 节点总数上限，避免把同一棵转发树反复拉取几十万次。
+    static thread_local std::set<std::string> visited;
+    static thread_local int total_nodes = 0;
+    if (depth == 0) {
+        // 每次顶层调用重置预算（同一条消息可能触发多次展开）
+        visited.clear();
+        total_nodes = 0;
+    }
     if (depth > 5) return; // 和文本展开的深度上限保持一致
+    if (total_nodes >= 200) return;
+    if (!visited.insert(forward_id).second) return; // 已展开过，跳过
+
     Json::Value param;
     param["id"] = forward_id;
     Json::Value info;
@@ -2106,6 +2216,8 @@ void gpt3_5::collect_forward_images(bot *p, const std::string &forward_id,
     const size_t before = urls.size();
     for (const auto &m : messages) {
         if (!m.isObject()) continue;
+        if (total_nodes >= 200) break; // 预算用完，剩下的节点不再处理
+        ++total_nodes;
         // 整条 node 丢进去递归扫描：NapCat 的节点结构不固定，
         // 图片可能在 message / content / data 任意一层
         collect_images_from_message(m, urls);
@@ -2124,11 +2236,14 @@ void gpt3_5::collect_forward_images(bot *p, const std::string &forward_id,
             }
         }
         else if (body.isString()) {
-            static const std::regex fwd_re(R"(\[CQ:forward,id=([^,\]]+))");
+            // 线性扫描（原来用 fwd_re 正则，超长连续段会爆栈）
             const std::string s = body.asString();
-            for (auto it = std::sregex_iterator(s.begin(), s.end(), fwd_re);
-                 it != std::sregex_iterator(); ++it) {
-                collect_forward_images(p, (*it)[1].str(), urls, depth + 1);
+            for (const auto &seg : cqscan::split(s)) {
+                if (!seg.is_cq || seg.type != "forward") continue;
+                const std::string id = cqscan::arg_value(seg.args, "id");
+                if (!id.empty()) {
+                    collect_forward_images(p, cq_decode(id), urls, depth + 1);
+                }
             }
         }
     }
@@ -2150,20 +2265,15 @@ Json::Value gpt3_5::build_user_content(const std::string &message,
     };
     std::vector<Segment> segs;
 
-    static const std::regex cq_image_re(R"(\[CQ:image[^\]]*\])");
-    size_t last = 0;
-    for (auto it = std::sregex_iterator(message.begin(), message.end(),
-                                        cq_image_re);
-         it != std::sregex_iterator(); ++it) {
-        if (it->position() > last) {
-            segs.push_back({false, message.substr(last, it->position() - last)});
+    // 线性扫描代替 std::regex(R"(\[CQ:image[^\]]*\])")：
+    // 后者的 [^\]]* 在超长连续段上会爆栈 SIGSEGV。
+    for (const auto &cqseg : cqscan::split(message)) {
+        if (!cqseg.is_cq || cqseg.type != "image") {
+            if (!cqseg.text.empty()) segs.push_back({false, cqseg.text});
+            continue;
         }
-        std::string url = cq_image_url(it->str());
+        std::string url = cq_decode(cqscan::arg_value(cqseg.args, "url"));
         segs.push_back({true, url});
-        last = it->position() + it->length();
-    }
-    if (last < message.size()) {
-        segs.push_back({false, message.substr(last)});
     }
 
     // 被引用消息里的图：常见用法是「回复这张图问问题」。
@@ -2197,12 +2307,14 @@ Json::Value gpt3_5::build_user_content(const std::string &message,
 
                 // 引用的消息本身是转发：展开里面的图
                 std::string quoted = messageArr_to_string(quoted_msg);
-                static const std::regex fwd_re(R"(\[CQ:forward,id=([^,\]]+))");
-                for (auto it = std::sregex_iterator(quoted.begin(), quoted.end(),
-                                                    fwd_re);
-                     it != std::sregex_iterator(); ++it) {
-                    collect_forward_images(conf.p, (*it)[1].str(), forward_urls,
-                                           0);
+                // 线性扫描（原来用 fwd_re 正则，超长连续段会爆栈）
+                for (const auto &cqseg : cqscan::split(quoted)) {
+                    if (!cqseg.is_cq || cqseg.type != "forward") continue;
+                    const std::string id = cqscan::arg_value(cqseg.args, "id");
+                    if (!id.empty()) {
+                        collect_forward_images(conf.p, cq_decode(id),
+                                               forward_urls, 0);
+                    }
                 }
             }
         }
@@ -2214,11 +2326,12 @@ Json::Value gpt3_5::build_user_content(const std::string &message,
     // 这些图不在 message 文本里（文本里只有 [CQ:forward,id=...]），
     // 所以不会和 segs 重复。
     {
-        static const std::regex fwd_re(R"(\[CQ:forward,id=([^,\]]+))");
-        for (auto it = std::sregex_iterator(message.begin(), message.end(),
-                                            fwd_re);
-             it != std::sregex_iterator(); ++it) {
-            collect_forward_images(conf.p, (*it)[1].str(), forward_urls, 0);
+        for (const auto &cqseg : cqscan::split(message)) {
+            if (!cqseg.is_cq || cqseg.type != "forward") continue;
+            const std::string id = cqscan::arg_value(cqseg.args, "id");
+            if (!id.empty()) {
+                collect_forward_images(conf.p, cq_decode(id), forward_urls, 0);
+            }
         }
     }
 
