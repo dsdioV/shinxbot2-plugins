@@ -334,7 +334,11 @@ gpt3_5::gpt3_5()
     if (search_count > 20) search_count = 20;
     search_max_rounds = res.get("search_max_rounds", 3).asInt();
     if (search_max_rounds < 1) search_max_rounds = 1;
-    if (search_max_rounds > 5) search_max_rounds = 5;
+    // 上限从 5 放到 12。原来是 5，撞上就原样返回"还要调工具"的响应，
+    // content 为空 → 上层报"API空返回！"（用户看到的其实是模型还想搜）。
+    // 12 轮足够覆盖"搜多轮才收敛"的正常场景；再多也不是加大能救的，
+    // 那种情况由下面的"强制收尾"兜住。
+    if (search_max_rounds > 12) search_max_rounds = 12;
 
     // 工具调用兜底端点。newapi 中转会丢 tool_calls，检测到畸形响应时
     // 整轮改用这里重跑。默认复用搜索 key + DeepSeek 官方。
@@ -1678,6 +1682,23 @@ void gpt3_5::process(std::string message, const msg_meta &conf)
                                     : "";
 
         if (trim(aimsg).empty()) {
+            // 空正文有好几种完全不同的成因，混在一起报"API空返回！"
+            // 既误导用户也让排查无从下手，所以先记下判别所需的全部信息。
+            const Json::Value &u = J["usage"];
+            int64_t comp_tok = u.isObject() ? u.get("completion_tokens", 0).asInt64() : 0;
+            int64_t prom_tok = u.isObject() ? u.get("prompt_tokens", 0).asInt64() : 0;
+            conf.p->setlog(
+                LOG::WARNING,
+                "openai: 空正文 finish_reason=" + finish_reason +
+                    " completion_tokens=" + std::to_string(comp_tok) +
+                    " prompt_tokens=" + std::to_string(prom_tok) +
+                    " tool_calls=" +
+                    std::to_string(J["choices"][0]["message"]["tool_calls"].size()) +
+                    " model=" + J["choices"][0].get("message", Json::Value())
+                                    .get("model", "").asString() +
+                    " raw=" +
+                    J["choices"][0]["message"].toStyledString().substr(0, 300));
+
             if (finish_reason == "content_filter") {
                 conf.p->cq_send("QAQ 响应被 OpenAI 安全策略过滤了", conf);
             }
@@ -1690,8 +1711,26 @@ void gpt3_5::process(std::string message, const msg_meta &conf)
                     "可用 .ai.set reply [更大的数值] 提高上限。",
                     conf);
             }
+            else if (finish_reason == "tool_calls") {
+                // 强制收尾也失败时才会走到这里
+                conf.p->cq_send(
+                    "搜索轮次用尽了，模型没能给出结论。请再问一次，"
+                    "或者把问题缩小一点。",
+                    conf);
+            }
+            else if (comp_tok == 0) {
+                // 一个 token 都没产出：不是模型的问题，是上游没算。
+                // 典型是通道超时/中断后返回了一个空壳。
+                conf.p->cq_send(
+                    "上游没有返回内容（通道超时或中断）。请重试。", conf);
+            }
             else {
-                conf.p->cq_send("API空返回！", conf);
+                // 花了 token 却没有正文：模型把预算耗在 reasoning 上，
+                // 只是 finish_reason 没如实标成 length。
+                conf.p->cq_send(
+                    "模型没输出正文（思考占满了预算）。"
+                    "可用 .ai.set reply [更大的数值] 提高上限。",
+                    conf);
             }
             return;
         }
@@ -2966,7 +3005,55 @@ Json::Value gpt3_5::run_chat_with_tools(Json::Value request, size_t keyid,
         // 防止模型无限调工具烧钱
         if (rounds >= search_max_rounds) {
             conf.p->setlog(LOG::WARNING,
-                           "openai: tool call round limit reached");
+                           "openai: tool call round limit reached (" +
+                               std::to_string(rounds) + ")，强制收尾");
+            // 撞上限时不能把"还要调工具"的响应原样交回去：它的 content
+            // 通常是空串，上层 trim 后为空就报"API空返回！"，用户看到的
+            // 其实只是模型还想继续搜。所以这里做两件事：
+            //   1. 把最后这批工具调用执行掉（结果对用户是有价值的）
+            //   2. 去掉 tools 再要一次，逼模型基于已有结果直接产出正文
+            Json::Value tail_msgs = request["messages"];
+            Json::Value tail_assistant;
+            tail_assistant["role"] = "assistant";
+            tail_assistant["content"] = msg.get("content", Json::Value());
+            tail_assistant["tool_calls"] = calls;
+            tail_msgs.append(tail_assistant);
+            for (const auto &call : calls) {
+                Json::Value tool_msg;
+                tool_msg["role"] = "tool";
+                tool_msg["tool_call_id"] = call.get("id", "").asString();
+                tool_msg["content"] = exec_tool_call(call, conf);
+                tail_msgs.append(tool_msg);
+            }
+
+            Json::Value final_req = request;
+            final_req["messages"] = tail_msgs;
+            final_req["model"] = cur_model;
+            // 不给它再搜的机会，只能把答案写出来
+            final_req.removeMember("tools");
+            final_req.removeMember("tool_choice");
+
+            try {
+                Json::Value final_resp = parse_api_response(do_post(
+                    cur_base, "/v1/chat/completions", false, final_req,
+                    {{"Content-Type", "application/json"},
+                     {"Authorization", "Bearer " + cur_key}},
+                    true));
+                const Json::Value &fcalls = final_resp["choices"];
+                if (fcalls.isArray() && !fcalls.empty() &&
+                    !trim(fcalls[0]["message"].get("content", "")
+                              .asString())
+                         .empty()) {
+                    return final_resp;
+                }
+                conf.p->setlog(
+                    LOG::WARNING,
+                    "openai: 强制收尾仍未给出正文，回退到原响应");
+            }
+            catch (...) {
+                // 收尾请求失败不影响主流程，返回原响应让上层按原逻辑处理
+                conf.p->setlog(LOG::WARNING, "openai: 强制收尾请求失败");
+            }
             return resp;
         }
         rounds++;
