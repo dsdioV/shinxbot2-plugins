@@ -1722,7 +1722,8 @@ void gpt3_5::process(std::string message, const msg_meta &conf)
                         "openai: content 为空但 reasoning_content 里有正文，"
                         "已改用后者（" + std::to_string(bracket_lines) +
                             " 处行首中括号）");
-                    finish_reason = "stop";
+                    // 刻意不改 finish_reason：如果原本是 length，说明这段
+                    // 正文也是被截断的，后面还要照常加"未完成"标记。
                 }
             }
         }
@@ -2995,6 +2996,46 @@ Json::Value gpt3_5::run_chat_with_tools(Json::Value request, size_t keyid,
                             std::to_string(empty_retries) + " 次重试");
                     std::this_thread::sleep_for(
                         std::chrono::milliseconds(800 * empty_retries));
+                    continue;
+                }
+                // 同一个中转重试再多次也没用：new-api 只对"非 2xx 状态码"
+                // 重试/切渠道（RetryTimes=5，
+                // AutomaticRetryStatusCodes=100-199,300-407,409-503,...），
+                // 而上游是用 HTTP 200 交回空壳的，它认为这就是成功。所以
+                // 渠道级 fallback 永远不会发生，只能由 bot 自己兜。
+                //
+                // 兜底端点用的是纯文本模型，带图的请求切过去必然 400，
+                // 所以只在「整轮请求里没有图片」时才切。
+                bool has_image = false;
+                const Json::Value &msgs_probe = request["messages"];
+                if (msgs_probe.isArray()) {
+                    for (const auto &pm : msgs_probe) {
+                        const Json::Value &pc = pm["content"];
+                        if (!pc.isArray()) continue;
+                        for (const auto &part : pc) {
+                            if (part.get("type", "").asString() ==
+                                "image_url") {
+                                has_image = true;
+                                break;
+                            }
+                        }
+                        if (has_image) break;
+                    }
+                }
+                if (!using_fallback && !has_image &&
+                    !trim(tool_fallback_base_url).empty() &&
+                    !trim(tool_fallback_key).empty() &&
+                    !trim(tool_fallback_model).empty()) {
+                    using_fallback = true;
+                    conf.p->setlog(
+                        LOG::WARNING,
+                        "openai: 上游连续返回空响应，切到兜底端点 " +
+                            tool_fallback_base_url + " model=" +
+                            tool_fallback_model);
+                    cur_base = tool_fallback_base_url;
+                    cur_model = tool_fallback_model;
+                    cur_key = tool_fallback_key;
+                    empty_retries = 0;
                     continue;
                 }
                 Json::Value err;
