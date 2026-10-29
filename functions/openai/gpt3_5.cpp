@@ -1681,6 +1681,52 @@ void gpt3_5::process(std::string message, const msg_meta &conf)
                                     ? J["choices"][0]["finish_reason"].asString() 
                                     : "";
 
+        // 上游偶发把成品回复写进 reasoning_content，content 留空。
+        // 实测样本：content=""，reasoning_content="  │\n[……]\n[（轻声）]
+        // \n[今晚这窗口里全是题。]…"，finish_reason=stop，completion_tokens
+        // 只有 55~160（离 MAX_REPLY 差三个数量级，所以跟上限无关）。
+        // 判据：正文格式是每行用半角中括号包裹；推理内容的思考通常用圆括号
+        // （）（如"（他说……）"），不会以 [ 开头。因此"至少两行以 [ 开头"
+        // 可以把它和真正的思考区分开。命中时把这段当正文用——那些话本来
+        // 就已经生成好了，丢掉只会让用户看到一句"模型没输出正文"。
+        if (trim(aimsg).empty()) {
+            const std::string reasoning =
+                J["choices"][0]["message"].get("reasoning_content", "").asString();
+            if (!trim(reasoning).empty()) {
+                // 按行首计数，行分隔既认 '\n' 也认 '|'（有些上游把行拼成
+                // "…[甲] | [乙] | [丙]" 的单行）。只统计行首的 '['，避免
+                // 把正文里引用的方括号误当成语句起始。
+                auto is_sep_at = [&](size_t i) {
+                    return i == 0 || reasoning[i - 1] == '\n' ||
+                           reasoning[i - 1] == '|';
+                };
+                size_t first_br = std::string::npos;
+                int bracket_lines = 0;
+                for (size_t i = 0; i < reasoning.size(); ++i) {
+                    if (reasoning[i] != '[') continue;
+                    size_t s = i;
+                    while (s > 0 && (reasoning[s - 1] == ' ' ||
+                                     reasoning[s - 1] == '\t')) {
+                        // 跳过 '[ ' 前的空白，仍要求再往前是分隔符
+                        --s;
+                    }
+                    if (!is_sep_at(s)) continue;
+                    ++bracket_lines;
+                    if (first_br == std::string::npos) first_br = i;
+                }
+                if (bracket_lines >= 2 && first_br != std::string::npos) {
+                    // 从第一处中括号开始截，丢掉前面那些无意义碎片
+                    aimsg = reasoning.substr(first_br);
+                    conf.p->setlog(
+                        LOG::WARNING,
+                        "openai: content 为空但 reasoning_content 里有正文，"
+                        "已改用后者（" + std::to_string(bracket_lines) +
+                            " 处行首中括号）");
+                    finish_reason = "stop";
+                }
+            }
+        }
+
         if (trim(aimsg).empty()) {
             // 空正文有好几种完全不同的成因，混在一起报"API空返回！"
             // 既误导用户也让排查无从下手，所以先记下判别所需的全部信息。
@@ -1725,11 +1771,14 @@ void gpt3_5::process(std::string message, const msg_meta &conf)
                     "上游没有返回内容（通道超时或中断）。请重试。", conf);
             }
             else {
-                // 花了 token 却没有正文：模型把预算耗在 reasoning 上，
-                // 只是 finish_reason 没如实标成 length。
+                // 花了 token 却没有正文，且 reasoning_content 里也没有可用
+                // 的中括号正文（否则上面已经救回来了）。这种情况是上游
+                // 把输出全塞进了思考通道，跟 MAX_REPLY 无关 —— 实测
+                // completion_tokens 只有几十到一百多，离上限差得远，
+                // 所以不能再劝用户"调大上限"，那只会让人白折腾。
                 conf.p->cq_send(
-                    "模型没输出正文（思考占满了预算）。"
-                    "可用 .ai.set reply [更大的数值] 提高上限。",
+                    "模型这次只输出了思考、没有正文（上游的通道错位，"
+                    "跟回复上限无关）。再发一次通常就好。",
                     conf);
             }
             return;
