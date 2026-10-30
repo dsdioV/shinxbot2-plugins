@@ -1707,6 +1707,15 @@ void gpt3_5::process(std::string message, const msg_meta &conf)
                     " prompt_tokens=" + std::to_string(prom_tok) +
                     " tool_calls=" +
                     std::to_string(J["choices"][0]["message"]["tool_calls"].size()) +
+                    // reasoning 长度是关键判据：非零 = 正文被写进了思考通道
+                    // （上游把答案塞进 reasoning_content 的已知故障形态），
+                    // 为零 = 上游真没产出任何东西。两者处理方式不同。
+                    " reasoning_len=" +
+                    std::to_string(
+                        J["choices"][0]["message"]
+                            .get("reasoning_content", "")
+                            .asString()
+                            .size()) +
                     " model=" + J["choices"][0].get("message", Json::Value())
                                     .get("model", "").asString() +
                     " raw=" +
@@ -1738,12 +1747,13 @@ void gpt3_5::process(std::string message, const msg_meta &conf)
                     "上游没有返回内容（通道超时或中断）。请重试。", conf);
             }
             else {
-                // 花了 token 却没有正文，但重试也救不回来。
+                // 花了 token 却没有正文，自动重发也没救回来。
                 // 跟 MAX_REPLY 无关：实测 completion_tokens 只有几十到
                 // 一百多，离上限差得远，所以绝不能劝用户"调大上限"。
+                // 再说"再发一次通常就好"也不诚实 —— 内部已经重发过了。
                 conf.p->cq_send(
                     "模型这次只输出了思考、没有正文（跟回复上限无关）。"
-                    "再发一次通常就好。",
+                    "已经自动重发过，还是这样；换个说法再问一次试试。",
                     conf);
             }
             return;
@@ -2917,9 +2927,14 @@ Json::Value gpt3_5::run_chat_with_tools(Json::Value request, size_t keyid,
     // 实测这是上游把正文写进了 reasoning_content、content 留空，
     // 跟 MAX_REPLY 无关（completion_tokens 只有几十到一百多）。
     // 复现不出来，也不该去思维链里截（那太武断，还可能带进碎片），
-    // 直接重发一次即可 —— 换个采样通常就有正文。
+    // 直接重发 —— 换个采样通常就有正文。
+    //
+    // 上限从 1 提到 2：2026-10-30 07:43 那次，第一次和重发都空了
+    // （两次是 prompt_tokens=62749 的同一份 body），只重试一次就放弃，
+    // 用户看到「模型这次只输出了思考」。实测这不是确定性的 —— 同一份
+    // body 后来连发 5 次全部正常，说明是上游瞬时状态，多给一次机会能盖掉。
     int empty_body_retries = 0;
-    static const int kMaxEmptyBodyRetries = 1;
+    static const int kMaxEmptyBodyRetries = 2;
 
     // 判断"上游给了个空壳"：choices 为空数组，且 usage 里一个 token 都没算。
     // 注意不能用 "choices 为空" 单独判定 —— 工具轮次里也可能出现空 choices，
@@ -3069,7 +3084,8 @@ Json::Value gpt3_5::run_chat_with_tools(Json::Value request, size_t keyid,
                 resp["choices"][0].get("finish_reason", "").asString();
             // content_filter 是策略拦截，重发也不会变；
             // length 是预算不足，重发只会再撞一次同样的墙。
-            // 其余情况（典型是 stop + 空串）重发一次通常就好了。
+            // 其余情况（典型是 stop + 空串）重发通常就好了，
+            // 偶尔要两次 —— 见上面 kMaxEmptyBodyRetries 的注释。
             if (trim(body).empty() && fr != "content_filter" &&
                 fr != "length" && empty_body_retries < kMaxEmptyBodyRetries) {
                 ++empty_body_retries;
@@ -3082,9 +3098,11 @@ Json::Value gpt3_5::run_chat_with_tools(Json::Value request, size_t keyid,
                                 ? resp["usage"].get("completion_tokens", 0)
                                       .asInt64()
                                 : 0) +
-                        "），重发一次");
+                        "），重发第 " + std::to_string(empty_body_retries) +
+                        " 次");
                 std::this_thread::sleep_for(
-                    std::chrono::milliseconds(400));
+                    std::chrono::milliseconds(
+                        600 * empty_body_retries));
                 continue;
             }
             return resp;
