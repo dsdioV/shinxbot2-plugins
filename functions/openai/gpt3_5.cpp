@@ -1658,8 +1658,21 @@ void gpt3_5::process(std::string message, const msg_meta &conf)
             save_history(id);
         }
         else {
-            conf.p->cq_send("Openai ERROR: " + J["error"]["message"].asString(),
-                            conf);
+            const std::string emsg = J["error"]["message"].asString();
+            // hdrfix 把自己检测到的"正文空、思考里全是字"转成 502，好让
+            // new-api 按 AutomaticRetryStatusCodes 重试/切渠道。new-api
+            // 试完所有次数仍失败时，bot 这边只会收到一串 HTTP 报错文本。
+            // 对用户来说那句原始报文没有意义，翻译成和本地判定一致的提示。
+            if (emsg.find("empty_content") != std::string::npos ||
+                emsg.find("aggregated content empty") != std::string::npos) {
+                conf.p->cq_send(
+                    "模型这次只输出了思考、没有正文（跟回复上限无关）。"
+                    "再发一次通常就好。",
+                    conf);
+            }
+            else {
+                conf.p->cq_send("Openai ERROR: " + emsg, conf);
+            }
         }
     }
     else {
