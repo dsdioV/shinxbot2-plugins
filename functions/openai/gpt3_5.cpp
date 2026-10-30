@@ -1681,53 +1681,6 @@ void gpt3_5::process(std::string message, const msg_meta &conf)
                                     ? J["choices"][0]["finish_reason"].asString() 
                                     : "";
 
-        // 上游偶发把成品回复写进 reasoning_content，content 留空。
-        // 实测样本：content=""，reasoning_content="  │\n[……]\n[（轻声）]
-        // \n[今晚这窗口里全是题。]…"，finish_reason=stop，completion_tokens
-        // 只有 55~160（离 MAX_REPLY 差三个数量级，所以跟上限无关）。
-        // 判据：正文格式是每行用半角中括号包裹；推理内容的思考通常用圆括号
-        // （）（如"（他说……）"），不会以 [ 开头。因此"至少两行以 [ 开头"
-        // 可以把它和真正的思考区分开。命中时把这段当正文用——那些话本来
-        // 就已经生成好了，丢掉只会让用户看到一句"模型没输出正文"。
-        if (trim(aimsg).empty()) {
-            const std::string reasoning =
-                J["choices"][0]["message"].get("reasoning_content", "").asString();
-            if (!trim(reasoning).empty()) {
-                // 按行首计数，行分隔既认 '\n' 也认 '|'（有些上游把行拼成
-                // "…[甲] | [乙] | [丙]" 的单行）。只统计行首的 '['，避免
-                // 把正文里引用的方括号误当成语句起始。
-                auto is_sep_at = [&](size_t i) {
-                    return i == 0 || reasoning[i - 1] == '\n' ||
-                           reasoning[i - 1] == '|';
-                };
-                size_t first_br = std::string::npos;
-                int bracket_lines = 0;
-                for (size_t i = 0; i < reasoning.size(); ++i) {
-                    if (reasoning[i] != '[') continue;
-                    size_t s = i;
-                    while (s > 0 && (reasoning[s - 1] == ' ' ||
-                                     reasoning[s - 1] == '\t')) {
-                        // 跳过 '[ ' 前的空白，仍要求再往前是分隔符
-                        --s;
-                    }
-                    if (!is_sep_at(s)) continue;
-                    ++bracket_lines;
-                    if (first_br == std::string::npos) first_br = i;
-                }
-                if (bracket_lines >= 2 && first_br != std::string::npos) {
-                    // 从第一处中括号开始截，丢掉前面那些无意义碎片
-                    aimsg = reasoning.substr(first_br);
-                    conf.p->setlog(
-                        LOG::WARNING,
-                        "openai: content 为空但 reasoning_content 里有正文，"
-                        "已改用后者（" + std::to_string(bracket_lines) +
-                            " 处行首中括号）");
-                    // 刻意不改 finish_reason：如果原本是 length，说明这段
-                    // 正文也是被截断的，后面还要照常加"未完成"标记。
-                }
-            }
-        }
-
         if (trim(aimsg).empty()) {
             // 空正文有好几种完全不同的成因，混在一起报"API空返回！"
             // 既误导用户也让排查无从下手，所以先记下判别所需的全部信息。
@@ -1772,14 +1725,12 @@ void gpt3_5::process(std::string message, const msg_meta &conf)
                     "上游没有返回内容（通道超时或中断）。请重试。", conf);
             }
             else {
-                // 花了 token 却没有正文，且 reasoning_content 里也没有可用
-                // 的中括号正文（否则上面已经救回来了）。这种情况是上游
-                // 把输出全塞进了思考通道，跟 MAX_REPLY 无关 —— 实测
-                // completion_tokens 只有几十到一百多，离上限差得远，
-                // 所以不能再劝用户"调大上限"，那只会让人白折腾。
+                // 花了 token 却没有正文，但重试也救不回来。
+                // 跟 MAX_REPLY 无关：实测 completion_tokens 只有几十到
+                // 一百多，离上限差得远，所以绝不能劝用户"调大上限"。
                 conf.p->cq_send(
-                    "模型这次只输出了思考、没有正文（上游的通道错位，"
-                    "跟回复上限无关）。再发一次通常就好。",
+                    "模型这次只输出了思考、没有正文（跟回复上限无关）。"
+                    "再发一次通常就好。",
                     conf);
             }
             return;
@@ -2949,6 +2900,13 @@ Json::Value gpt3_5::run_chat_with_tools(Json::Value request, size_t keyid,
     // 这种是瞬时的，重试往往立刻就好，不该把错误抛给用户。
     int empty_retries = 0;
     static const int kMaxEmptyRetries = 2;
+    // content 为空（但 choices 在、token 也算了）的单独计数。
+    // 实测这是上游把正文写进了 reasoning_content、content 留空，
+    // 跟 MAX_REPLY 无关（completion_tokens 只有几十到一百多）。
+    // 复现不出来，也不该去思维链里截（那太武断，还可能带进碎片），
+    // 直接重发一次即可 —— 换个采样通常就有正文。
+    int empty_body_retries = 0;
+    static const int kMaxEmptyBodyRetries = 1;
 
     // 判断"上游给了个空壳"：choices 为空数组，且 usage 里一个 token 都没算。
     // 注意不能用 "choices 为空" 单独判定 —— 工具轮次里也可能出现空 choices，
@@ -2971,7 +2929,8 @@ Json::Value gpt3_5::run_chat_with_tools(Json::Value request, size_t keyid,
             // 上游 Gemini 在 15~34MB 这个量级会边界性地回 413
             // （同一个 34MB 有时 200 有时 413），所以必须知道体积构成，
             // 否则无从判断该砍历史、砍图还是砍工具结果。
-            if (rounds == 0 && empty_retries == 0) {
+            if (rounds == 0 && empty_retries == 0 &&
+                empty_body_retries == 0) {
                 conf.p->setlog(LOG::INFO,
                                describe_request_size(request, rounds,
                                                     empty_retries));
@@ -3090,7 +3049,33 @@ Json::Value gpt3_5::run_chat_with_tools(Json::Value request, size_t keyid,
         const Json::Value &calls = msg["tool_calls"];
 
         // 没有工具调用 = 正常结束
-        if (!calls.isArray() || calls.empty()) return resp;
+        if (!calls.isArray() || calls.empty()) {
+            const std::string body =
+                msg.get("content", "").asString();
+            const std::string fr =
+                resp["choices"][0].get("finish_reason", "").asString();
+            // content_filter 是策略拦截，重发也不会变；
+            // length 是预算不足，重发只会再撞一次同样的墙。
+            // 其余情况（典型是 stop + 空串）重发一次通常就好了。
+            if (trim(body).empty() && fr != "content_filter" &&
+                fr != "length" && empty_body_retries < kMaxEmptyBodyRetries) {
+                ++empty_body_retries;
+                conf.p->setlog(
+                    LOG::WARNING,
+                    "openai: 正文为空（finish_reason=" + fr +
+                        "，completion_tokens=" +
+                        std::to_string(
+                            resp["usage"].isObject()
+                                ? resp["usage"].get("completion_tokens", 0)
+                                      .asInt64()
+                                : 0) +
+                        "），重发一次");
+                std::this_thread::sleep_for(
+                    std::chrono::milliseconds(400));
+                continue;
+            }
+            return resp;
+        }
 
         // 防止模型无限调工具烧钱
         if (rounds >= search_max_rounds) {
