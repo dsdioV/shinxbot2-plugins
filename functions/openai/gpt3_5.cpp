@@ -662,10 +662,15 @@ bool gpt3_5::compress_history(int64_t id, size_t keyid, const msg_meta &conf,
 
     Json::Value resp;
     try {
+        // 注意：headers 里不要再放 Content-Type。
+        // 框架的 do_post 在 HTTP_connect.cpp:145 已经把 content_type 作为
+        // client.Post(...) 的第 4 个参数传进去了，httplib 会自己补一个
+        // Content-Type；headers map 里再写一份就会发出两个同名头
+        // （实测报文：两行 Content-Type: application/json）。
+        // 中转（new-api）对此宽容，但 api.deepseek.com 直接 400/415。
         resp = parse_api_response(
             do_post(base_url, "/v1/chat/completions", false, req,
-                    {{"Content-Type", "application/json"},
-                     {"Authorization", "Bearer " + key[keyid]}},
+                    {{"Authorization", "Bearer " + key[keyid]}},
                     true));
     }
     catch (std::string e) {
@@ -1722,7 +1727,9 @@ void gpt3_5::process(std::string message, const msg_meta &conf)
                     J["choices"][0]["message"].toStyledString().substr(0, 300));
 
             if (finish_reason == "content_filter") {
-                conf.p->cq_send("QAQ 响应被 OpenAI 安全策略过滤了", conf);
+                // 实际链路是 gemini-3.8-flash 经 hdrfix → d1api，
+                // 说"OpenAI 安全策略"会把排查方向带偏。
+                conf.p->cq_send("QAQ 响应被上游安全过滤拦掉了", conf);
             }
             else if (finish_reason == "length") {
                 // 推理模型（如带 reasoning 的中转）会把 max_tokens 全花在
@@ -1761,10 +1768,23 @@ void gpt3_5::process(std::string message, const msg_meta &conf)
 
         aimsg = do_black(aimsg);
 
+        // 上游把回复从中间截断时，标记只发给群里，不写进历史。
+        // 写进历史的后果在 2026-11-10 那次看得很清楚：模型下一轮读到
+        // 自己那句被截断的回复 + 这行提示，就开始讨论"又被过滤了"，
+        // 把一次上游故障扩散成连续好几轮复读。
+        std::string send_msg = aimsg;
         if (finish_reason == "length") {
-            aimsg += "\n(QAQ 响应因长度限制未完成)";
+            send_msg += "\n(QAQ 响应因长度限制未完成)";
         } else if (finish_reason == "content_filter") {
-            aimsg += "\n(QAQ 响应被 OpenAI 安全策略部分过滤)";
+            // 截断点在句子中间（实测断在"末雨吟花"之后和"好在"之后），
+            // 说明是上游对生成内容做了过滤，不是长度问题。
+            // 记下来才知道它多久发生一次、断在什么位置。
+            send_msg += "\n(QAQ 响应被上游安全过滤截断)";
+            conf.p->setlog(
+                LOG::WARNING,
+                "openai: 回复被上游安全过滤截断 len=" +
+                    std::to_string(aimsg.size()) + " tail=" +
+                    aimsg.substr(aimsg.size() > 80 ? aimsg.size() - 80 : 0));
         }
 
         int64_t prompt_tokens = 0;
@@ -1783,7 +1803,7 @@ void gpt3_5::process(std::string message, const msg_meta &conf)
         }
 
         std::string reply_msg = "[CQ:reply,id=" + std::to_string(conf.message_id) +
-                                "]" + aimsg;
+                                "]" + send_msg;
     {
         std::unique_lock<std::recursive_mutex> lock_data(data_lock);
             last_prompt_tokens[id] = prompt_tokens;
@@ -2739,10 +2759,12 @@ std::string gpt3_5::tool_web_search(const std::string &query,
 
     Json::Value resp;
     try {
+        // headers 里不能写 Content-Type：框架 do_post 已经传了，重复会变成
+        // 两个同名头，api.deepseek.com 直接回 400 "Content-Type must be
+        // application/json"。详见 compress_history 里那段注释。
         resp = string_to_json(do_post(
             search_base_url, "/v1/tools/search", false, req,
-            {{"Content-Type", "application/json"},
-             {"Authorization", "Bearer " + search_api_key}},
+            {{"Authorization", "Bearer " + search_api_key}},
             false));
     }
     catch (const std::string &e) {
@@ -2965,8 +2987,7 @@ Json::Value gpt3_5::run_chat_with_tools(Json::Value request, size_t keyid,
             }
             const std::string raw = do_post(
                 cur_base, "/v1/chat/completions", false, request,
-                {{"Content-Type", "application/json"},
-                 {"Authorization", "Bearer " + cur_key}},
+                {{"Authorization", "Bearer " + cur_key}},
                 true);
             resp = parse_api_response(raw);
             // 中转把上游流式原文透传过来（通常是上游超时返回空流）：
@@ -3142,8 +3163,7 @@ Json::Value gpt3_5::run_chat_with_tools(Json::Value request, size_t keyid,
             try {
                 Json::Value final_resp = parse_api_response(do_post(
                     cur_base, "/v1/chat/completions", false, final_req,
-                    {{"Content-Type", "application/json"},
-                     {"Authorization", "Bearer " + cur_key}},
+                    {{"Authorization", "Bearer " + cur_key}},
                     true));
                 const Json::Value &fcalls = final_resp["choices"];
                 if (fcalls.isArray() && !fcalls.empty() &&
