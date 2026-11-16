@@ -21,14 +21,18 @@ namespace {
 
 class SessionGuard {
 public:
-    SessionGuard(gpt3_5 &owner, int64_t id, std::function<void(int64_t)> rel)
-        : owner_(owner), id_(id), rel_(std::move(rel)), active_(true) {}
+    SessionGuard(gpt3_5 &owner, uint64_t task_id,
+                 std::function<void(uint64_t)> rel)
+        : owner_(owner),
+          task_id_(task_id),
+          rel_(std::move(rel)),
+          active_(task_id != 0) {}
     ~SessionGuard() { release(); }
     void release()
     {
         if (active_) {
             active_ = false;
-            rel_(id_);
+            rel_(task_id_);
         }
     }
     SessionGuard(const SessionGuard &) = delete;
@@ -36,8 +40,8 @@ public:
 
 private:
     gpt3_5 &owner_;
-    int64_t id_;
-    std::function<void(int64_t)> rel_;
+    uint64_t task_id_;
+    std::function<void(uint64_t)> rel_;
     bool active_;
 };
 
@@ -375,81 +379,77 @@ int64_t gpt3_5::session_id_from_conf(const msg_meta &conf)
                                         : ((conf.user_id << 1) | 1);
 }
 
-bool gpt3_5::try_acquire_session(int64_t id, const msg_meta &conf,
-                                 const std::string &nickname,
-                                 const std::string &stage,
-                                 bool ensure_default_prompt)
+uint64_t gpt3_5::try_acquire_session(int64_t id, const msg_meta &conf,
+                                     const std::string &nickname,
+                                     const std::string &stage,
+                                     bool ensure_default_prompt)
 {
     std::string busy_msg;
     {
         std::lock_guard<std::recursive_mutex> lock(data_lock);
-        auto it = running_tasks.find(id);
-        if (it != running_tasks.end()) {
-            auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
-                               std::chrono::steady_clock::now() -
-                               it->second.started_at)
-                               .count();
-            busy_msg = "当前会话正在处理上一条请求（" + it->second.stage +
-                       "，已耗时 " + std::to_string(elapsed) +
-                       "s），请稍候；可用 .ai.bg 查看进度。";
-        }
-        else if (!is_open) {
+        if (!is_open) {
             busy_msg = "已关闭。" + close_message;
         }
         else {
             if (ensure_default_prompt && history.find(id) == history.end()) {
                 pre_default[id] = default_prompt;
             }
+            uint64_t tid = next_task_id++;
+            if (tid == 0) tid = next_task_id++;
             RunningTask task;
+            task.task_id = tid;
             task.id = id;
             task.is_group = (conf.message_type == "group");
             task.user_id = conf.user_id;
             task.nickname = nickname;
             task.stage = stage;
             task.started_at = std::chrono::steady_clock::now();
-            running_tasks[id] = std::move(task);
-            return true;
+            running_tasks[tid] = std::move(task);
+            return tid;
         }
     }
     conf.p->cq_send(busy_msg, conf);
-    return false;
+    return 0;
 }
 
-void gpt3_5::release_session(int64_t id)
+void gpt3_5::release_session(uint64_t task_id)
 {
+    if (task_id == 0) return;
     std::lock_guard<std::recursive_mutex> lock(data_lock);
-    running_tasks.erase(id);
+    running_tasks.erase(task_id);
 }
 
-void gpt3_5::set_session_stage(int64_t id, const std::string &stage)
+void gpt3_5::set_session_stage(uint64_t task_id, const std::string &stage)
 {
+    if (task_id == 0) return;
     std::lock_guard<std::recursive_mutex> lock(data_lock);
-    auto it = running_tasks.find(id);
+    auto it = running_tasks.find(task_id);
     if (it != running_tasks.end()) {
         it->second.stage = stage;
     }
 }
 
-std::string gpt3_5::format_running_tasks()
+std::string gpt3_5::format_running_tasks(int64_t id)
 {
     std::lock_guard<std::recursive_mutex> lock(data_lock);
-    if (running_tasks.empty()) {
-        return "当前没有正在运行的 AI 请求。";
+    std::vector<RunningTask> matched;
+    for (const auto &kv : running_tasks) {
+        if (kv.second.id == id) {
+            matched.push_back(kv.second);
+        }
+    }
+    if (matched.empty()) {
+        return "当前会话没有正在运行的 AI 请求。";
     }
     const auto now = std::chrono::steady_clock::now();
-    std::string out = "当前运行中的 AI 请求（共 " +
-                      std::to_string(running_tasks.size()) + " 个）：\n";
-    for (const auto &kv : running_tasks) {
-        const RunningTask &t = kv.second;
+    std::string out = "当前会话运行中的 AI 请求（共 " +
+                      std::to_string(matched.size()) + " 个）：\n";
+    for (const auto &t : matched) {
         auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
                            now - t.started_at)
                            .count();
-        std::string scope = t.is_group
-                                ? ("群 " + std::to_string(t.id >> 1))
-                                : ("私聊 " + std::to_string(t.id >> 1));
-        out += "- [" + scope + "] " + t.nickname + "(" +
-               std::to_string(t.user_id) + ")：" + t.stage + "（已耗时 " +
-               std::to_string(elapsed) + "s）\n";
+        out += "- " + t.nickname + "(" + std::to_string(t.user_id) + ")：" +
+               t.stage + "（已耗时 " + std::to_string(elapsed) + "s）\n";
     }
     return trim(out);
 }
@@ -477,7 +477,7 @@ void gpt3_5::fallback_trim_history(int64_t id, int rounds)
 }
 
 bool gpt3_5::compress_history(int64_t id, size_t keyid, const msg_meta &conf,
-                              std::string *error_message)
+                              std::string *error_message, uint64_t task_id)
 {
     Json::Value old_history;
     std::string current_mode;
@@ -518,7 +518,7 @@ bool gpt3_5::compress_history(int64_t id, size_t keyid, const msg_meta &conf,
     const ResolvedModeConfig mcfg =
         resolve_mode_config(current_mode.empty() ? default_prompt : current_mode);
 
-    set_session_stage(id, "压缩历史上下文");
+    set_session_stage(task_id, "压缩历史上下文");
     perform_archive(id, conf, true, true);
 
     Json::Value req;
@@ -869,7 +869,7 @@ void gpt3_5::process(std::string message, const msg_meta &conf)
         return;
     }
     if (explicit_ai && (command == "bg" || command == ".bg")) {
-        conf.p->cq_send(format_running_tasks(), conf);
+        conf.p->cq_send(format_running_tasks(id), conf);
         return;
     }
     if (explicit_ai && (command == "mcp" || command == ".mcp")) {
@@ -888,7 +888,7 @@ void gpt3_5::process(std::string message, const msg_meta &conf)
          }},
         {".bg",
          [&]() {
-             conf.p->cq_send(format_running_tasks(), conf);
+             conf.p->cq_send(format_running_tasks(id), conf);
              return true;
          }},
         {".mcp",
@@ -945,16 +945,17 @@ void gpt3_5::process(std::string message, const msg_meta &conf)
                  conf.p->cq_send("No avaliable key!", conf);
                  return true;
              }
-             if (!try_acquire_session(id, conf, nickname, "手动压缩上下文")) {
+             uint64_t task_id = try_acquire_session(id, conf, nickname, "手动压缩上下文");
+             if (task_id == 0) {
                  return true;
              }
              SessionGuard guard(
-                 *this, id, [this](int64_t sid) { release_session(sid); });
+                 *this, task_id, [this](uint64_t tid) { release_session(tid); });
 
              size_t compress_keyid = get_avaliable_key();
              std::string compress_error;
-             bool compressed =
-                 compress_history(id, compress_keyid, conf, &compress_error);
+             bool compressed = compress_history(
+                 id, compress_keyid, conf, &compress_error, task_id);
              guard.release();
              if (compressed) {
                  save_history(id);
@@ -1224,11 +1225,13 @@ void gpt3_5::process(std::string message, const msg_meta &conf)
         return;
     }
 
-    if (!try_acquire_session(id, conf, nickname, "准备上下文与图片", false)) {
+    uint64_t task_id =
+        try_acquire_session(id, conf, nickname, "准备上下文与图片", false);
+    if (task_id == 0) {
         return;
     }
     SessionGuard session_guard(
-        *this, id, [this](int64_t sid) { release_session(sid); });
+        *this, task_id, [this](uint64_t tid) { release_session(tid); });
 
     std::string cur_mode;
     {
@@ -1279,7 +1282,7 @@ void gpt3_5::process(std::string message, const msg_meta &conf)
             lock_data.unlock();
             std::string compress_error;
             bool compressed =
-                compress_history(id, keyid, conf, &compress_error);
+                compress_history(id, keyid, conf, &compress_error, task_id);
             lock_data.lock();
             if (!compressed) {
                 break;
@@ -1348,7 +1351,7 @@ void gpt3_5::process(std::string message, const msg_meta &conf)
 
     J["temperature"] = mcfg.temperature;
     J["max_tokens"] = MAX_REPLY;
-    J = run_chat_with_tools(J, keyid, conf, mcfg);
+    J = run_chat_with_tools(J, keyid, task_id, conf, mcfg);
     conf.p->setlog(LOG::INFO, "openai: user " + std::to_string(conf.user_id));
 
     if (J.isMember("error")) {

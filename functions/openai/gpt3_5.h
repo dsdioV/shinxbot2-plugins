@@ -15,6 +15,7 @@
 class gpt3_5 : public processable {
 private:
     struct RunningTask {
+        uint64_t task_id = 0;
         int64_t id = 0;
         bool is_group = false;
         userid_t user_id = 0;
@@ -51,7 +52,8 @@ private:
     };
 
     std::recursive_mutex data_lock;
-    std::map<int64_t, RunningTask> running_tasks;
+    std::map<uint64_t, RunningTask> running_tasks;
+    uint64_t next_task_id = 1;
     std::map<std::pair<int64_t, userid_t>, std::chrono::steady_clock::time_point>
         active_followup_until;
     bool is_open = true;
@@ -146,6 +148,7 @@ private:
 
     /// 一轮对话：发请求 → 模型要工具 → 执行 → 回灌 → 再请求。
     Json::Value run_chat_with_tools(Json::Value request, size_t keyid,
+                                    uint64_t task_id,
                                     const msg_meta &conf,
                                     const ResolvedModeConfig &mcfg);
     /// 检测"声称调工具却没给 tool_calls"的畸形响应。
@@ -188,16 +191,17 @@ private:
     std::string content_to_text(const Json::Value &content);
 
     static int64_t session_id_from_conf(const msg_meta &conf);
-    bool try_acquire_session(int64_t id, const msg_meta &conf,
-                             const std::string &nickname,
-                             const std::string &stage = "准备上下文",
-                             bool ensure_default_prompt = true);
-    void release_session(int64_t id);
-    void set_session_stage(int64_t id, const std::string &stage);
-    std::string format_running_tasks();
+    uint64_t try_acquire_session(int64_t id, const msg_meta &conf,
+                                 const std::string &nickname,
+                                 const std::string &stage = "准备上下文",
+                                 bool ensure_default_prompt = true);
+    void release_session(uint64_t task_id);
+    void set_session_stage(uint64_t task_id, const std::string &stage);
+    std::string format_running_tasks(int64_t id);
 
     bool compress_history(int64_t id, size_t keyid, const msg_meta &conf,
-                          std::string *error_message = nullptr);
+                          std::string *error_message = nullptr,
+                          uint64_t task_id = 0);
     void fallback_trim_history(int64_t id, int rounds = 1);
 
     // Archive and Restore features

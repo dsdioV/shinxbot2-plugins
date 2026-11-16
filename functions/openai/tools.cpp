@@ -587,10 +587,10 @@ std::string gpt3_5::describe_request_size(const Json::Value &request,
 }
 
 Json::Value gpt3_5::run_chat_with_tools(Json::Value request, size_t keyid,
+                                        uint64_t task_id,
                                         const msg_meta &conf,
                                         const ResolvedModeConfig &mcfg)
 {
-    const int64_t sid = session_id_from_conf(conf);
     Json::Value tools = build_tool_defs(conf, mcfg);
     if (!tools.empty()) {
         request["tools"] = tools;
@@ -623,7 +623,7 @@ Json::Value gpt3_5::run_chat_with_tools(Json::Value request, size_t keyid,
     while (true) {
         try {
             request["model"] = cur_model;
-            set_session_stage(sid, "请求模型（第 " + std::to_string(rounds + 1) +
+            set_session_stage(task_id, "请求模型（第 " + std::to_string(rounds + 1) +
                                        " 轮）");
             if (rounds == 0 && empty_retries == 0 &&
                 empty_body_retries == 0) {
@@ -645,7 +645,7 @@ Json::Value gpt3_5::run_chat_with_tools(Json::Value request, size_t keyid,
                         LOG::WARNING,
                         "openai: 上游返回空响应，第 " +
                             std::to_string(empty_retries) + " 次重试");
-                    set_session_stage(sid, "上游空响应，重试第 " +
+                    set_session_stage(task_id, "上游空响应，重试第 " +
                                                std::to_string(empty_retries) +
                                                " 次");
                     std::this_thread::sleep_for(
@@ -752,7 +752,7 @@ Json::Value gpt3_5::run_chat_with_tools(Json::Value request, size_t keyid,
                                 : 0) +
                         "），重发第 " + std::to_string(empty_body_retries) +
                         " 次");
-                set_session_stage(sid, "正文为空，重发第 " +
+                set_session_stage(task_id, "正文为空，重发第 " +
                                            std::to_string(empty_body_retries) +
                                            " 次");
                 std::this_thread::sleep_for(
@@ -773,7 +773,7 @@ Json::Value gpt3_5::run_chat_with_tools(Json::Value request, size_t keyid,
             tail_assistant["tool_calls"] = calls;
             tail_msgs.append(tail_assistant);
             for (const auto &call : calls) {
-                set_session_stage(sid, "调用工具：" +
+                set_session_stage(task_id, "调用工具：" +
                                            call["function"]["name"].asString());
                 Json::Value tool_msg;
                 tool_msg["role"] = "tool";
@@ -789,7 +789,7 @@ Json::Value gpt3_5::run_chat_with_tools(Json::Value request, size_t keyid,
             final_req.removeMember("tool_choice");
 
             try {
-                set_session_stage(sid, "整理工具结果并生成最终回复");
+                set_session_stage(task_id, "整理工具结果并生成最终回复");
                 Json::Value final_resp = openai_internal::parse_api_response(
                     do_post(cur_base, "/v1/chat/completions", false, final_req,
                             {{"Authorization", "Bearer " + cur_key}},
@@ -820,7 +820,7 @@ Json::Value gpt3_5::run_chat_with_tools(Json::Value request, size_t keyid,
         history_msgs.append(assistant_msg);
 
         for (const auto &call : calls) {
-            set_session_stage(sid, "调用工具：" +
+            set_session_stage(task_id, "调用工具：" +
                                        call["function"]["name"].asString());
             std::string result = exec_tool_call(call, conf, mcfg);
             Json::Value tool_msg;
