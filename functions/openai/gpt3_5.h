@@ -54,6 +54,8 @@ private:
     std::recursive_mutex data_lock;
     std::map<uint64_t, RunningTask> running_tasks;
     uint64_t next_task_id = 1;
+    // 空响应保险丝：每会话连续撞上游空响应的次数（成功回复后清零）。
+    std::map<int64_t, int> empty_fail_streak;
     std::map<std::pair<int64_t, userid_t>, std::chrono::steady_clock::time_point>
         active_followup_until;
     bool is_open = true;

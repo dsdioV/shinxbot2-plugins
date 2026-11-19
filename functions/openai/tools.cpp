@@ -688,6 +688,8 @@ Json::Value gpt3_5::run_chat_with_tools(Json::Value request, size_t keyid,
                 err["error"]["message"] =
                     "上游连续返回空响应（模型超时或中转中断），已重试 " +
                     std::to_string(kMaxEmptyRetries) + " 次。";
+                // 保险丝标记：让上层识别这类失败并计数/收缩历史。
+                err["__empty_upstream__"] = true;
                 return err;
             }
             if (!resp.isMember("choices") && !resp.isMember("error")) {

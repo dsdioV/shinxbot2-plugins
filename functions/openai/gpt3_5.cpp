@@ -137,6 +137,18 @@ gpt3_5::gpt3_5()
     if (bash_max_output_chars < 500) bash_max_output_chars = 500;
     bash_workdir = trim(res.get("bash_workdir", "").asString());
 
+    // 图片入库压缩与请求展开预算（历史图片曾全量展开把请求体撑到
+    // 8MB 导致上游空响应；线上配置设为 1024/72/2.0 以收紧）。
+    media_max_edge = res.get("media_max_edge", 1568).asInt();
+    if (media_max_edge < 512) media_max_edge = 512;
+    if (media_max_edge > 2048) media_max_edge = 2048;
+    media_quality = res.get("media_quality", 82).asInt();
+    if (media_quality < 50) media_quality = 50;
+    if (media_quality > 95) media_quality = 95;
+    media_budget_mb = res.get("media_budget_mb", 8.0).asDouble();
+    if (media_budget_mb < 0.5) media_budget_mb = 0.5;
+    if (media_budget_mb > 16.0) media_budget_mb = 16.0;
+
     tool_fallback_base_url = res.get("tool_fallback_base_url", "").asString();
     tool_fallback_model = res.get("tool_fallback_model", "").asString();
     tool_fallback_key = res.get("tool_fallback_key", "").asString();
@@ -260,6 +272,9 @@ void gpt3_5::save_file()
     J["bash_timeout_sec"] = bash_timeout_sec;
     J["bash_max_output_chars"] = bash_max_output_chars;
     if (!bash_workdir.empty()) J["bash_workdir"] = bash_workdir;
+    J["media_max_edge"] = media_max_edge;
+    J["media_quality"] = media_quality;
+    J["media_budget_mb"] = media_budget_mb;
     J["tool_fallback_base_url"] = tool_fallback_base_url;
     J["tool_fallback_model"] = tool_fallback_model;
     J["tool_fallback_key"] = tool_fallback_key;
@@ -1368,6 +1383,38 @@ void gpt3_5::process(std::string message, const msg_meta &conf)
             save_history(id);
         }
         else {
+            // ── 空响应保险丝 ─────────────────────────────────────
+            // 阈值（MAX_TOKEN-RED_LINE）可能远高于链路真实承载力而
+            // 永不触发压缩。上游连续空响应通常意味着请求体/上下文撞
+            // 到了链路极限，历史原样保留只会让下一条消息重复失败。
+            // 这里对连续失败计数，达到 2 次就强制收缩历史自愈。
+            bool empty_upstream = J.isMember("__empty_upstream__") &&
+                                  J["__empty_upstream__"].asBool();
+            int streak = 0;
+            if (empty_upstream) {
+                std::lock_guard<std::recursive_mutex> lock_data(data_lock);
+                streak = ++empty_fail_streak[id];
+            }
+            if (streak >= 2) {
+                conf.p->setlog(
+                    LOG::WARNING,
+                    "openai: 空响应连续 " + std::to_string(streak) +
+                        " 次，保险丝触发：强制收缩会话 " +
+                        std::to_string(id) + " 的历史");
+                std::string compress_error;
+                bool shrunk = compress_history(id, keyid, conf,
+                                               &compress_error, task_id);
+                if (!shrunk) {
+                    // 历史太短压缩不了（或压缩请求本身也失败）：裁剪兜底
+                    fallback_trim_history(id, 5);
+                }
+                save_history(id);
+                conf.p->cq_send(
+                    "这次请求把上游压挂了（疑似上下文过大）。"
+                    "已自动压缩/裁剪历史，请再发一次试试。",
+                    conf);
+                return;
+            }
             const std::string emsg = J["error"]["message"].asString();
             if (emsg.find("empty_content") != std::string::npos ||
                 emsg.find("aggregated content empty") != std::string::npos) {
@@ -1527,6 +1574,10 @@ void gpt3_5::process(std::string message, const msg_meta &conf)
             history[id].append(J);
         }
         save_history(id);
+        {
+            std::lock_guard<std::recursive_mutex> lock_data(data_lock);
+            empty_fail_streak.erase(id);
+        }
         if (is_group) {
             refresh_followup(conf.group_id, conf.user_id);
         }
