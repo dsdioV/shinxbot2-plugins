@@ -124,6 +124,10 @@ private:
     int media_max_edge = 1568;
     int media_quality = 82;
     double media_budget_mb = 8.0;
+    // 单次请求里最多展开几张历史图。体积预算之外的第二道闸：
+    // 实测 #165（Mistral 直连）在 ~1.5MB / 20 张图附近耗时断崖
+    // （18 张 3.5s → 22 张 29.7s → 28 张 236s 超时），故数量也要限。
+    int media_max_images = 12;
 
     // ── 工具调用（web search / web fetch / MCP）───────────────────
     std::string search_api_key;

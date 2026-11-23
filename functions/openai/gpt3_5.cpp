@@ -148,6 +148,9 @@ gpt3_5::gpt3_5()
     media_budget_mb = res.get("media_budget_mb", 8.0).asDouble();
     if (media_budget_mb < 0.5) media_budget_mb = 0.5;
     if (media_budget_mb > 16.0) media_budget_mb = 16.0;
+    media_max_images = res.get("media_max_images", 12).asInt();
+    if (media_max_images < 1) media_max_images = 1;
+    if (media_max_images > 64) media_max_images = 64;
 
     tool_fallback_base_url = res.get("tool_fallback_base_url", "").asString();
     tool_fallback_model = res.get("tool_fallback_model", "").asString();
@@ -275,6 +278,7 @@ void gpt3_5::save_file()
     J["media_max_edge"] = media_max_edge;
     J["media_quality"] = media_quality;
     J["media_budget_mb"] = media_budget_mb;
+    J["media_max_images"] = media_max_images;
     J["tool_fallback_base_url"] = tool_fallback_base_url;
     J["tool_fallback_model"] = tool_fallback_model;
     J["tool_fallback_key"] = tool_fallback_key;
@@ -1323,7 +1327,9 @@ void gpt3_5::process(std::string message, const msg_meta &conf)
             static_cast<size_t>(media_budget_mb * 1024 * 1024);
 
         std::vector<bool> keep_image(sz, false);
+        int images_kept = 0;
         for (Json::ArrayIndex idx = sz; idx > 0; --idx) {
+            if (images_kept >= media_max_images) break;
             const Json::Value &entry = h[idx - 1];
             const Json::Value &content = entry["content"];
             if (!content.isArray()) continue;
@@ -1341,6 +1347,7 @@ void gpt3_5::process(std::string message, const msg_meta &conf)
             if (need <= media_budget) {
                 media_budget -= need;
                 keep_image[idx - 1] = true;
+                ++images_kept;
             }
         }
 
