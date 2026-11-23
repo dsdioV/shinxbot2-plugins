@@ -737,7 +737,8 @@ Json::Value gpt3_5::run_chat_with_tools(Json::Value request, size_t keyid,
         const Json::Value &calls = msg["tool_calls"];
 
         if (!calls.isArray() || calls.empty()) {
-            const std::string body = msg.get("content", "").asString();
+            const std::string body =
+                openai_internal::message_content_text(msg.get("content", Json::Value()));
             const std::string fr =
                 resp["choices"][0].get("finish_reason", "").asString();
             if (trim(body).empty() && fr != "content_filter" &&
@@ -798,8 +799,9 @@ Json::Value gpt3_5::run_chat_with_tools(Json::Value request, size_t keyid,
                             true));
                 const Json::Value &fcalls = final_resp["choices"];
                 if (fcalls.isArray() && !fcalls.empty() &&
-                    !trim(fcalls[0]["message"].get("content", "")
-                              .asString())
+                    !trim(openai_internal::message_content_text(
+                              fcalls[0]["message"].get("content",
+                                                          Json::Value())))
                          .empty()) {
                     return final_resp;
                 }

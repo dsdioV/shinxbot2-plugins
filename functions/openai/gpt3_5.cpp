@@ -593,7 +593,8 @@ bool gpt3_5::compress_history(int64_t id, size_t keyid, const msg_meta &conf,
     }
 
     std::string summary =
-        trim(resp["choices"][0]["message"]["content"].asString());
+        trim(openai_internal::message_content_text(
+            resp["choices"][0]["message"]["content"]));
     if (summary.empty()) {
         if (error_message) *error_message = "summary is empty";
         return false;
@@ -1440,7 +1441,8 @@ void gpt3_5::process(std::string message, const msg_meta &conf)
             return;
         }
 
-        std::string aimsg = J["choices"][0]["message"]["content"].asString();
+        std::string aimsg = openai_internal::message_content_text(
+            J["choices"][0]["message"]["content"]);
         std::string finish_reason =
             J["choices"][0].isMember("finish_reason")
                 ? J["choices"][0]["finish_reason"].asString()

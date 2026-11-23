@@ -199,6 +199,37 @@ inline std::string sha256_hex(const std::string &data)
     return out;
 }
 
+/// 从 chat.completion 的 message.content 里取纯文本。
+///
+/// 为什么需要：部分上游（Mistral 开启 reasoning_effort 后、Anthropic 系
+/// 中转）返回的 content 不再是字符串，而是 content blocks 数组：
+///   [{"type":"thinking",...},{"type":"text","text":"答案"}]
+/// jsoncpp 对数组调用 asString() 会返回空串，于是正文被判为空，bot 就会
+/// 误报"空返回/只输出了思考"。这里统一提取所有 text 块并拼接。
+inline std::string message_content_text(const Json::Value &content)
+{
+    if (content.isString()) return content.asString();
+    if (!content.isArray()) return std::string();
+
+    std::string out;
+    for (const auto &part : content) {
+        if (part.isString()) {
+            out += part.asString();
+            continue;
+        }
+        if (!part.isObject()) continue;
+        const std::string type = part.get("type", "text").asString();
+        if (type == "text") {
+            std::string t = part.get("text", "").asString();
+            if (t.empty() && part.isMember("content")) {
+                t = message_content_text(part["content"]);
+            }
+            out += t;
+        }
+    }
+    return out;
+}
+
 inline int64_t estimate_text_tokens(const std::string &s)
 {
     int64_t ascii = 0, cjk = 0;
