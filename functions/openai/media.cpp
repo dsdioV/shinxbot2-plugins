@@ -56,7 +56,7 @@ void scan_for_image_urls(const Json::Value &node,
 
     const Json::Value &data = node["data"];
     if (data.isObject()) {
-        std::string url = data.get("url", "").asString();
+        std::string url = openai_internal::json_to_string(data["url"]);
         const bool looks_image =
             !url.empty() &&
             (data.isMember("file") || data.isMember("file_size") ||
@@ -245,10 +245,12 @@ void gpt3_5::collect_forward_images(bot *p, const std::string &forward_id,
         return;
     }
 
-    if (info["retcode"].asInt() != 0 || !info.isMember("data")) {
+    if (openai_internal::json_to_int64(info["retcode"]) != 0 ||
+        !info.isMember("data")) {
         p->setlog(LOG::WARNING,
                   "openai: forward retcode=" +
-                      std::to_string(info["retcode"].asInt()) +
+                      std::to_string(openai_internal::json_to_int64(
+                          info["retcode"])) +
                       " has_data=" + std::to_string(info.isMember("data")) +
                       " body=" + info.toStyledString().substr(0, 300));
         return;
@@ -290,7 +292,8 @@ void gpt3_5::collect_forward_images(bot *p, const std::string &forward_id,
             for (const auto &seg : body) {
                 if (!seg.isObject()) continue;
                 if (seg.get("type", "").asString() != "forward") continue;
-                std::string nested = seg["data"].get("id", "").asString();
+                std::string nested = openai_internal::json_to_string(
+                    seg["data"]["id"]);
                 if (!nested.empty()) {
                     collect_forward_images(p, nested, urls, depth + 1);
                 }
@@ -345,11 +348,13 @@ Json::Value gpt3_5::build_user_content(const std::string &message,
             conf.p->setlog(
                 LOG::INFO,
                 "openai: quoted reply_id=" + std::to_string(reply_id) +
-                    " retcode=" + std::to_string(info["retcode"].asInt()) +
+                    " retcode=" +
+                        std::to_string(openai_internal::json_to_int64(
+                            info["retcode"])) +
                     " body=" +
                     Json::writeString(Json::StreamWriterBuilder(), info)
                         .substr(0, 600));
-            if (info["retcode"].asInt() == 0 &&
+            if (openai_internal::json_to_int64(info["retcode"]) == 0 &&
                 info["data"].isMember("message")) {
                 const Json::Value &quoted_msg = info["data"]["message"];
                 collect_images_from_message(quoted_msg, quoted_images);
@@ -441,14 +446,15 @@ Json::Value gpt3_5::expand_content_for_api(const Json::Value &content,
 
     Json::Value out(Json::arrayValue);
     for (const auto &part : content) {
-        std::string type = part.get("type", "").asString();
+        std::string type = openai_internal::json_to_string(part["type"]);
         if (type != "image_ref") {
             out.append(part);
             continue;
         }
 
-        const std::string file = part.get("file", "").asString();
-        const std::string mime = part.get("mime", "image/jpeg").asString();
+        const std::string file = openai_internal::json_to_string(part["file"]);
+        std::string mime = openai_internal::json_to_string(part["mime"]);
+        if (mime.empty()) mime = "image/jpeg";
         fs::path path = fs::path(media_dir()) / file;
         if (file.empty() || !fs::exists(path)) {
             Json::Value fallback;
@@ -513,9 +519,9 @@ std::string gpt3_5::content_to_text(const Json::Value &content)
 
     std::string out;
     for (const auto &part : content) {
-        std::string type = part.get("type", "").asString();
+        std::string type = openai_internal::json_to_string(part["type"]);
         if (type == "text") {
-            out += part.get("text", "").asString();
+            out += openai_internal::json_to_string(part["text"]);
         }
         else if (type == "image_ref" || type == "image_url") {
             out += "[图片]";

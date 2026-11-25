@@ -199,6 +199,54 @@ inline std::string sha256_hex(const std::string &data)
     return out;
 }
 
+/// 任意 JSON 值安全转字符串。
+///
+/// 为什么需要：中转（new-api）返回的 error.message 可能是对象
+/// （如 422 的 {"detail":[...]}），reasoning_content 可能是数组；
+/// jsoncpp 对非字符串直接 asString() 会抛 LogicError
+/// "Type is not convertible to string"，整个 process() 被异常打断。
+inline std::string json_to_string(const Json::Value &v)
+{
+    if (v.isString()) return v.asString();
+    if (v.isNull()) return std::string();
+    if (v.isBool()) return v.asBool() ? "true" : "false";
+    if (v.isInt64() || v.isUInt64() || v.isInt() || v.isUInt()) {
+        char buf[32];
+        if (v.isUInt64()) snprintf(buf, sizeof(buf), "%llu",
+                                   static_cast<unsigned long long>(v.asUInt64()));
+        else snprintf(buf, sizeof(buf), "%lld",
+                      static_cast<long long>(v.asInt64()));
+        return buf;
+    }
+    if (v.isDouble()) {
+        char buf[40];
+        snprintf(buf, sizeof(buf), "%g", v.asDouble());
+        return buf;
+    }
+    Json::StreamWriterBuilder wb;
+    wb["indentation"] = "";
+    wb["emitUTF8"] = true;
+    return Json::writeString(wb, v);
+}
+
+/// 任意 JSON 值安全转整数，失败返回 def。
+inline int64_t json_to_int64(const Json::Value &v, int64_t def = 0)
+{
+    if (v.isInt64() || v.isUInt64() || v.isInt() || v.isUInt()) {
+        return v.asInt64();
+    }
+    if (v.isDouble()) return static_cast<int64_t>(v.asDouble());
+    if (v.isString()) {
+        try {
+            return std::stoll(trim(v.asString()));
+        }
+        catch (...) {
+            return def;
+        }
+    }
+    return def;
+}
+
 /// 从 chat.completion 的 message.content 里取纯文本。
 ///
 /// 为什么需要：部分上游（Mistral 开启 reasoning_effort 后、Anthropic 系
@@ -228,6 +276,65 @@ inline std::string message_content_text(const Json::Value &content)
         }
     }
     return out;
+}
+
+/// 从 content blocks 里取思考文本（thinking / reasoning / redacted_thinking）。
+/// Mistral 开启 reasoning 后会把内容放进 {"type":"thinking","thinking":[{"text":...}]}。
+inline std::string message_thinking_text(const Json::Value &content)
+{
+    if (!content.isArray()) return std::string();
+
+    std::string out;
+    for (const auto &part : content) {
+        if (!part.isObject()) continue;
+        const std::string type = json_to_string(part["type"]);
+        if (type != "thinking" && type != "reasoning" &&
+            type != "redacted_thinking") {
+            continue;
+        }
+        const Json::Value &th = part["thinking"];
+        if (th.isArray()) {
+            for (const auto &seg : th) {
+                if (seg.isObject()) out += json_to_string(seg["text"]);
+                else out += json_to_string(seg);
+            }
+        }
+        else if (!th.isNull()) {
+            out += json_to_string(th);
+        }
+        out += "\n";
+    }
+    return out;
+}
+
+/// 从文本里挑出"像是回复正文"的行：只保留含中日韩字符的行。
+///
+/// 用途：Mistral 偶发把整段回复写进 thinking 块，正文为空。此时若把
+/// thinking 原样当回复，会把英文推理过程一起发给群里；这里按行过滤，
+/// 只留中文行（bot 的输出格式就是每行 [中文]）。
+inline std::string extract_cjk_lines(const std::string &s)
+{
+    std::string out;
+    size_t pos = 0;
+    while (pos <= s.size()) {
+        size_t eol = s.find('\n', pos);
+        if (eol == std::string::npos) eol = s.size();
+        std::string line = s.substr(pos, eol - pos);
+        pos = eol + 1;
+
+        bool has_cjk = false;
+        for (size_t i = 0; i + 2 < line.size() + 1 && i < line.size(); ++i) {
+            const unsigned char c = static_cast<unsigned char>(line[i]);
+            if (c >= 0xE0) { has_cjk = true; break; }
+        }
+        if (!has_cjk) {
+            if (eol == s.size()) break;
+            continue;
+        }
+        if (!trim(line).empty()) out += trim(line) + "\n";
+        if (eol == s.size()) break;
+    }
+    return trim(out);
 }
 
 inline int64_t estimate_text_tokens(const std::string &s)

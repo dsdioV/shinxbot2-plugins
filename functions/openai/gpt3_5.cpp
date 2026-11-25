@@ -587,7 +587,8 @@ bool gpt3_5::compress_history(int64_t id, size_t keyid, const msg_meta &conf,
 
     if (resp.isMember("error")) {
         if (error_message)
-            *error_message = resp["error"]["message"].asString();
+            *error_message =
+                openai_internal::json_to_string(resp["error"]["message"]);
         return false;
     }
     if (!resp.isMember("choices") || !resp["choices"].isArray() ||
@@ -1378,8 +1379,9 @@ void gpt3_5::process(std::string message, const msg_meta &conf)
     conf.p->setlog(LOG::INFO, "openai: user " + std::to_string(conf.user_id));
 
     if (J.isMember("error")) {
-        if (J["error"]["message"].asString().find(
-                "This model's maximum context length is") == 0) {
+        const std::string err_msg =
+            openai_internal::json_to_string(J["error"]["message"]);
+        if (err_msg.find("This model's maximum context length is") == 0) {
             conf.p->cq_send("Openai ERROR: history message is too long. Please "
                             "try again or try .ai.reset",
                             conf);
@@ -1423,7 +1425,7 @@ void gpt3_5::process(std::string message, const msg_meta &conf)
                     conf);
                 return;
             }
-            const std::string emsg = J["error"]["message"].asString();
+            const std::string emsg = err_msg;
             if (emsg.find("empty_content") != std::string::npos ||
                 emsg.find("aggregated content empty") != std::string::npos) {
                 conf.p->cq_send(
@@ -1448,11 +1450,13 @@ void gpt3_5::process(std::string message, const msg_meta &conf)
             return;
         }
 
-        std::string aimsg = openai_internal::message_content_text(
-            J["choices"][0]["message"]["content"]);
+        const Json::Value &resp_msg = J["choices"][0]["message"];
+        std::string aimsg =
+            openai_internal::message_content_text(resp_msg["content"]);
         std::string finish_reason =
             J["choices"][0].isMember("finish_reason")
-                ? J["choices"][0]["finish_reason"].asString()
+                ? openai_internal::json_to_string(
+                      J["choices"][0]["finish_reason"])
                 : "";
 
         if (trim(aimsg).empty()) {
@@ -1470,15 +1474,19 @@ void gpt3_5::process(std::string message, const msg_meta &conf)
                     std::to_string(
                         J["choices"][0]["message"]["tool_calls"].size()) +
                     " reasoning_len=" +
-                    std::to_string(J["choices"][0]["message"]
-                                       .get("reasoning_content", "")
-                                       .asString()
+                    std::to_string(openai_internal::message_thinking_text(
+                                       resp_msg["content"])
+                                       .size()) +
+                    " reasoning_field=" +
+                    std::to_string(openai_internal::json_to_string(
+                                       resp_msg.isMember("reasoning_content")
+                                           ? resp_msg["reasoning_content"]
+                                           : Json::Value())
                                        .size()) +
                     " model=" +
-                    J["choices"][0]
-                        .get("message", Json::Value())
-                        .get("model", "")
-                        .asString() +
+                    openai_internal::json_to_string(
+                        resp_msg.isMember("model") ? resp_msg["model"]
+                                                   : Json::Value()) +
                     " raw=" +
                     J["choices"][0]["message"].toStyledString().substr(0, 300));
 
@@ -1528,17 +1536,16 @@ void gpt3_5::process(std::string message, const msg_meta &conf)
         int64_t prompt_tokens = 0;
         int64_t completion_tokens = 0;
         int64_t total_tokens = 0;
-        if (J.isMember("usage")) {
-            if (J["usage"].isMember("prompt_tokens")) {
-                prompt_tokens = J["usage"]["prompt_tokens"].asInt64();
-            }
-            if (J["usage"].isMember("completion_tokens")) {
-                completion_tokens = J["usage"]["completion_tokens"].asInt64();
-            }
-            if (J["usage"].isMember("total_tokens")) {
-                total_tokens = J["usage"]["total_tokens"].asInt64();
-            }
-        }
+        prompt_tokens = openai_internal::json_to_int64(
+            J["usage"].isMember("prompt_tokens") ? J["usage"]["prompt_tokens"]
+                                                    : Json::Value());
+        completion_tokens = openai_internal::json_to_int64(
+            J["usage"].isMember("completion_tokens")
+                ? J["usage"]["completion_tokens"]
+                : Json::Value());
+        total_tokens = openai_internal::json_to_int64(
+            J["usage"].isMember("total_tokens") ? J["usage"]["total_tokens"]
+                                                  : Json::Value());
 
         std::string reply_msg =
             "[CQ:reply,id=" + std::to_string(conf.message_id) + "]" + send_msg;

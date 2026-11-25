@@ -1,5 +1,6 @@
 #include "mcp_client.h"
 #include "httplib.h"
+#include "openai_internal.h"
 
 #include <algorithm>
 #include <cctype>
@@ -254,7 +255,9 @@ bool McpManager::ensure_initialized_locked(ServerState &st, std::string &err)
         return false;
     }
     if (resp.isMember("error")) {
-        err = resp["error"].get("message", "initialize failed").asString();
+        err = openai_internal::json_to_string(
+            resp["error"].isMember("message") ? resp["error"]["message"]
+                                             : Json::Value());
         st.last_error = err;
         return false;
     }
@@ -293,7 +296,9 @@ bool McpManager::ensure_initialized_locked(ServerState &st, std::string &err)
         return false;
     }
     if (resp.isMember("error")) {
-        err = resp["error"].get("message", "tools/list failed").asString();
+        err = openai_internal::json_to_string(
+            resp["error"].isMember("message") ? resp["error"]["message"]
+                                             : Json::Value());
         st.last_error = err;
         return false;
     }
@@ -416,8 +421,11 @@ bool McpManager::try_call_tool(const std::string &exposed_name,
         }
 
         if (resp.isMember("error")) {
-            std::string emsg =
-                resp["error"].get("message", "unknown mcp error").asString();
+            std::string emsg = openai_internal::json_to_string(
+                resp["error"].isMember("message")
+                    ? resp["error"]["message"]
+                    : Json::Value());
+            if (emsg.empty()) emsg = "unknown mcp error";
             out_log = "mcp rpc error (" + target_tool.remote_name + "): " + emsg;
             out_text = "MCP 工具返回错误：" + emsg;
             return true;
@@ -428,9 +436,9 @@ bool McpManager::try_call_tool(const std::string &exposed_name,
         if (result.isMember("content") && result["content"].isArray()) {
             for (const auto &item : result["content"]) {
                 if (!item.isObject()) continue;
-                if (item.get("type", "").asString() == "text") {
+                if (openai_internal::json_to_string(item["type"]) == "text") {
                     if (!text.empty()) text += "\n";
-                    text += item.get("text", "").asString();
+                    text += openai_internal::json_to_string(item["text"]);
                 }
             }
         }

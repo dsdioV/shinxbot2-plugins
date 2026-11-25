@@ -229,7 +229,8 @@ std::string gpt3_5::tool_web_search(const std::string &query,
 
     if (resp.isMember("error")) {
         std::string msg = resp["error"].isMember("message")
-                              ? resp["error"]["message"].asString()
+                              ? openai_internal::json_to_string(
+                                    resp["error"]["message"])
                               : "unknown error";
         conf.p->setlog(LOG::WARNING, "openai: web_search api error: " + msg);
         return "搜索接口返回错误：" + msg;
@@ -473,8 +474,12 @@ std::string gpt3_5::exec_tool_call(const Json::Value &call,
                                    const msg_meta &conf,
                                    const ResolvedModeConfig &mcfg)
 {
-    std::string name = call["function"]["name"].asString();
-    std::string raw_args = call["function"]["arguments"].asString();
+    std::string name = openai_internal::json_to_string(
+        call.isMember("function") ? call["function"]["name"]
+                                   : Json::Value());
+    std::string raw_args = openai_internal::json_to_string(
+        call.isMember("function") ? call["function"]["arguments"]
+                                   : Json::Value());
 
     Json::Value args;
     try {
@@ -519,11 +524,16 @@ bool gpt3_5::is_malformed_tool_response(const Json::Value &resp)
         return false;
     }
     const Json::Value &ch = resp["choices"][0];
-    if (ch.get("finish_reason", "").asString() != "tool_calls") return false;
+    if (openai_internal::json_to_string(ch.get("finish_reason", Json::Value())) !=
+        "tool_calls") {
+        return false;
+    }
 
     const Json::Value &calls = ch["message"]["tool_calls"];
     const bool has_calls = calls.isArray() && !calls.empty();
-    const bool has_text = !trim(ch["message"].get("content", "").asString()).empty();
+    const bool has_text = !trim(openai_internal::message_content_text(
+                              ch["message"].get("content", Json::Value())))
+                              .empty();
     return !has_calls && !has_text;
 }
 
@@ -607,7 +617,7 @@ Json::Value gpt3_5::run_chat_with_tools(Json::Value request, size_t keyid,
     int empty_retries = 0;
     static const int kMaxEmptyRetries = 2;
     int empty_body_retries = 0;
-    static const int kMaxEmptyBodyRetries = 2;
+    static const int kMaxEmptyBodyRetries = 3;
 
     auto looks_like_empty_upstream = [](const Json::Value &r) {
         if (!r.isObject()) return false;
@@ -615,8 +625,10 @@ Json::Value gpt3_5::run_chat_with_tools(Json::Value request, size_t keyid,
         if (!r["choices"].empty()) return false;
         const Json::Value &u = r["usage"];
         if (!u.isObject()) return true;
-        const int64_t prompt = u.get("prompt_tokens", 0).asInt64();
-        const int64_t completion = u.get("completion_tokens", 0).asInt64();
+        const int64_t prompt = openai_internal::json_to_int64(
+            u.get("prompt_tokens", Json::Value()));
+        const int64_t completion = openai_internal::json_to_int64(
+            u.get("completion_tokens", Json::Value()));
         return prompt == 0 && completion == 0;
     };
 
@@ -737,10 +749,10 @@ Json::Value gpt3_5::run_chat_with_tools(Json::Value request, size_t keyid,
         const Json::Value &calls = msg["tool_calls"];
 
         if (!calls.isArray() || calls.empty()) {
-            const std::string body =
-                openai_internal::message_content_text(msg.get("content", Json::Value()));
-            const std::string fr =
-                resp["choices"][0].get("finish_reason", "").asString();
+            const std::string body = openai_internal::message_content_text(
+                msg.get("content", Json::Value()));
+            const std::string fr = openai_internal::json_to_string(
+                resp["choices"][0].get("finish_reason", Json::Value()));
             if (trim(body).empty() && fr != "content_filter" &&
                 fr != "length" && empty_body_retries < kMaxEmptyBodyRetries) {
                 ++empty_body_retries;
@@ -748,16 +760,26 @@ Json::Value gpt3_5::run_chat_with_tools(Json::Value request, size_t keyid,
                     LOG::WARNING,
                     "openai: 正文为空（finish_reason=" + fr +
                         "，completion_tokens=" +
-                        std::to_string(
+                        std::to_string(openai_internal::json_to_int64(
                             resp["usage"].isObject()
-                                ? resp["usage"].get("completion_tokens", 0)
-                                      .asInt64()
-                                : 0) +
+                                ? resp["usage"].get("completion_tokens",
+                                                          Json::Value())
+                                : Json::Value())) +
                         "），重发第 " + std::to_string(empty_body_retries) +
                         " 次");
                 set_session_stage(task_id, "正文为空，重发第 " +
                                            std::to_string(empty_body_retries) +
                                            " 次");
+                // 原样重发大概率还是同样的结果：模型把内容全写进了思考块。
+                // 这里追加一条提示，明确要求把答案写在正文里（而不是只思考）。
+                {
+                    Json::Value hint;
+                    hint["role"] = "user";
+                    hint["content"] =
+                        "（你上一条回复只有思考、没有正文。"
+                        "请现在直接把要发给我的内容用正文输出，不要只输出思考。）";
+                    request["messages"].append(hint);
+                }
                 std::this_thread::sleep_for(
                     std::chrono::milliseconds(600 * empty_body_retries));
                 continue;
@@ -777,10 +799,12 @@ Json::Value gpt3_5::run_chat_with_tools(Json::Value request, size_t keyid,
             tail_msgs.append(tail_assistant);
             for (const auto &call : calls) {
                 set_session_stage(task_id, "调用工具：" +
-                                           call["function"]["name"].asString());
+                    openai_internal::json_to_string(
+                        call["function"]["name"]));
                 Json::Value tool_msg;
                 tool_msg["role"] = "tool";
-                tool_msg["tool_call_id"] = call.get("id", "").asString();
+                tool_msg["tool_call_id"] = openai_internal::json_to_string(
+                    call.get("id", Json::Value()));
                 tool_msg["content"] = exec_tool_call(call, conf, mcfg);
                 tail_msgs.append(tool_msg);
             }
@@ -825,11 +849,12 @@ Json::Value gpt3_5::run_chat_with_tools(Json::Value request, size_t keyid,
 
         for (const auto &call : calls) {
             set_session_stage(task_id, "调用工具：" +
-                                       call["function"]["name"].asString());
+                openai_internal::json_to_string(call["function"]["name"]));
             std::string result = exec_tool_call(call, conf, mcfg);
             Json::Value tool_msg;
             tool_msg["role"] = "tool";
-            tool_msg["tool_call_id"] = call.get("id", "").asString();
+            tool_msg["tool_call_id"] = openai_internal::json_to_string(
+                call.get("id", Json::Value()));
             tool_msg["content"] = result;
             history_msgs.append(tool_msg);
         }

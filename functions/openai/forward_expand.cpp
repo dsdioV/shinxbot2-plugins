@@ -15,7 +15,8 @@ std::string gpt3_5::get_quoted_content(const bot *p, int64_t reply_id, int depth
     Json::Value msg_info =
         string_to_json(p->cq_send("get_msg", get_msg_param));
 
-    if (msg_info["retcode"].asInt() != 0 || !msg_info.isMember("data"))
+    if (openai_internal::json_to_int64(msg_info["retcode"]) != 0 ||
+        !msg_info.isMember("data"))
         return "[Failed to fetch message]";
 
     Json::Value &msg_data = msg_info["data"];
@@ -74,8 +75,10 @@ std::string gpt3_5::get_quoted_content(const bot *p, int64_t reply_id, int depth
                             else cleaned += "[" + type + "]";
                         }
 
-                        std::string nick = m["sender"]["nickname"].asString();
-                        uint64_t uid = m["sender"]["user_id"].asUInt64();
+                        std::string nick = openai_internal::json_to_string(
+                            m["sender"]["nickname"]);
+                        uint64_t uid = static_cast<uint64_t>(
+        openai_internal::json_to_int64(m["sender"]["user_id"]));
                         if (uid != 0)
                             result += "[" + nick + "(" + std::to_string(uid) +
                                       ")]：" + cleaned;
@@ -99,7 +102,8 @@ std::string gpt3_5::get_quoted_content(const bot *p, int64_t reply_id, int depth
 
     uint64_t uid = 0;
     if (msg_data.isMember("sender") && msg_data["sender"].isMember("user_id")) {
-        uid = msg_data["sender"]["user_id"].asUInt64();
+        uid = static_cast<uint64_t>(
+            openai_internal::json_to_int64(msg_data["sender"]["user_id"]));
     }
 
     content = simplify_cq_codes(content, p->get_botqq());
@@ -135,7 +139,8 @@ std::string gpt3_5::expand_forward_content(const bot *p,
     Json::Value fwd_info = string_to_json(
         p->cq_send("get_forward_msg", get_fwd_param));
 
-    if (fwd_info["retcode"].asInt() != 0 || !fwd_info.isMember("data"))
+    if (openai_internal::json_to_int64(fwd_info["retcode"]) != 0 ||
+        !fwd_info.isMember("data"))
         return "[Failed to fetch forward message]";
 
     Json::Value messages = fwd_info["data"].isMember("messages")
@@ -189,10 +194,11 @@ std::string gpt3_5::expand_forward_content(const bot *p,
 
             if (!m.isMember("sender")) continue;
 
-            std::string nick = m["sender"]["nickname"].isString()
-                                   ? m["sender"]["nickname"].asString()
-                                   : "Unknown";
-            uint64_t uid = m["sender"]["user_id"].asUInt64();
+            std::string nick = openai_internal::json_to_string(
+                m["sender"]["nickname"]);
+            if (nick.empty()) nick = "Unknown";
+            uint64_t uid = static_cast<uint64_t>(
+        openai_internal::json_to_int64(m["sender"]["user_id"]));
 
             if (uid != 0) {
                 result += "[" + nick + "(" + std::to_string(uid) + ")]：" +
